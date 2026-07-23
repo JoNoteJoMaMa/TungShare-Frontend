@@ -303,6 +303,7 @@ export default function App() {
   const peerRef = useRef(null);
   const torrentClient = useRef(null);
   const syncChannel = useRef(null);
+  const wakeLock = useRef(null); // Screen Wake Lock to prevent mobile refresh during seeding
   
   const chatBottomRef = useRef(null);
   const fileBottomRef = useRef(null);
@@ -332,7 +333,47 @@ export default function App() {
       if (torrentClient.current) {
         try { torrentClient.current.destroy(); } catch (e) {}
       }
+      // Release wake lock on unmount
+      if (wakeLock.current) {
+        try { wakeLock.current.release(); } catch (e) {}
+        wakeLock.current = null;
+      }
     };
+  }, []);
+
+  // Wake Lock helper — acquire and re-acquire on visibility restore
+  const acquireWakeLock = async () => {
+    if (!('wakeLock' in navigator)) return;
+    try {
+      if (wakeLock.current) return; // already held
+      wakeLock.current = await navigator.wakeLock.request('screen');
+      wakeLock.current.addEventListener('release', () => {
+        wakeLock.current = null;
+      });
+    } catch (e) {
+      // Wake Lock is a nice-to-have; silently ignore if denied
+    }
+  };
+
+  const releaseWakeLock = () => {
+    if (wakeLock.current) {
+      try { wakeLock.current.release(); } catch (e) {}
+      wakeLock.current = null;
+    }
+  };
+
+  // Re-acquire wake lock when user returns to the tab (mobile browsers release it on hide)
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        // Re-acquire only if we are actively seeding
+        if (torrentClient.current && torrentClient.current.torrents.some(t => t.done === false)) {
+          acquireWakeLock();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, []);
 
   // Browser & Mobile Navigation Protection Guard (Page Reload & Back Button Interception)
@@ -738,8 +779,19 @@ export default function App() {
 
       if (!torrentClient.current) return;
 
+      // Acquire Wake Lock so mobile browser doesn't suspend/refresh while seeding
+      acquireWakeLock();
+
       try {
-        const seedingTorrent = torrentClient.current.seed(file, { announce: TRACKER_URLS }, (torrent) => {
+        // uploadThrottle limits upload bandwidth to reduce memory pressure on mobile
+        // (512 KB/s per seeder is plenty for P2P; prevents RAM spike causing tab kill)
+        const isMobileDevice = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+        const seedOptions = {
+          announce: TRACKER_URLS,
+          ...(isMobileDevice ? { uploadThrottle: 512 * 1024 } : {})
+        };
+
+        const seedingTorrent = torrentClient.current.seed(file, seedOptions, (torrent) => {
           setStatusText(`ปล่อย ${fileList.length} ไฟล์สำเร็จ! Magnet URIs ถูกส่งเข้าห้องแล้ว`);
 
           const msgId = 'torrent_' + Math.random().toString(36).substr(2, 9);
@@ -765,17 +817,28 @@ export default function App() {
             try { peerRef.current.send(JSON.stringify(meta)); } catch (e) {}
           }
           syncChannel.current?.postMessage(meta);
+
+          // Release wake lock when the torrent is fully seeded to all peers
+          torrent.on('idle', () => {
+            // 'idle' fires when all connected peers have finished downloading
+            // Only release if no other torrents are still actively uploading
+            if (torrentClient.current && !torrentClient.current.torrents.some(t => t.uploadSpeed > 0)) {
+              releaseWakeLock();
+            }
+          });
         });
 
         if (seedingTorrent && seedingTorrent.on) {
           seedingTorrent.on('error', (err) => {
             console.error('Seeding torrent error:', err);
             setStatusText(`[Seed Error]: ${err.message}`);
+            releaseWakeLock();
           });
         }
       } catch (e) {
         console.error('WebTorrent seed error:', e);
         setStatusText(`[Seed Fail]: ${e.message}`);
+        releaseWakeLock();
       }
     });
   };
