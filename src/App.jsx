@@ -13,9 +13,10 @@ const BASE_SERVER_URL = (import.meta.env.VITE_BACKEND_URL || (
 
 const getTrackerUrls = (baseUrl) => {
   const wsUrl = baseUrl.replace(/^http/, 'ws');
+  // Use canonical /announce path so all seeders & downloaders connect to the exact same tracker URL
+  const backendTrackerUrl = `${wsUrl}/announce`;
   return [
-    wsUrl,
-    `${wsUrl}/announce`,
+    backendTrackerUrl,
     'wss://tracker.openwebtorrent.com',
     'wss://tracker.webtorrent.dev'
   ];
@@ -698,6 +699,17 @@ export default function App() {
       return;
     }
 
+    // 10b. Peer requests immediate tracker re-announce for a magnet link
+    if (data.type === 'request-torrent-reannounce' && data.magnetURI) {
+      if (torrentClient.current) {
+        const torrent = torrentClient.current.get(data.magnetURI);
+        if (torrent && torrent.discovery && torrent.discovery.tracker) {
+          try { torrent.discovery.tracker.announce(); } catch (e) {}
+        }
+      }
+      return;
+    }
+
     // 11. Receiving room history from an existing peer (Option B)
     if (data.type === 'room-history') {
       const historyMessages = data.messages || [];
@@ -1143,9 +1155,10 @@ export default function App() {
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
     );
 
-    // Pulse request-init to wake up WebSockets and warm up peer connections instantly
+    // Pulse request-init and request-torrent-reannounce over WebSocket to force seeder tracker re-announce
     if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
       chatWs.current.send(JSON.stringify({ type: 'request-init' }));
+      chatWs.current.send(JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI }));
     }
 
     let writableStream = null;
