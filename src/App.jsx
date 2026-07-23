@@ -1247,12 +1247,22 @@ export default function App() {
     if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
       chatWs.current.send(JSON.stringify({ type: 'request-init' }));
       chatWs.current.send(reannounceMsg);
-      // Delayed 600ms pulse to ensure mobile ICE candidate gathering completes
+      // Delayed 600ms & 1500ms pulses to ensure mobile ICE candidate gathering completes
       setTimeout(() => {
         if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
           try { chatWs.current.send(reannounceMsg); } catch (e) {}
         }
       }, 600);
+      setTimeout(() => {
+        if (torrent && (torrent.numPeers === 0 || torrent.progress === 0)) {
+          if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+            try {
+              chatWs.current.send(JSON.stringify({ type: 'request-init' }));
+              chatWs.current.send(reannounceMsg);
+            } catch (e) {}
+          }
+        }
+      }, 1500);
     }
     if (peerRef.current && peerRef.current.connected) {
       try { peerRef.current.send(reannounceMsg); } catch (e) {}
@@ -1447,19 +1457,29 @@ export default function App() {
 
     const updateStats = () => {
       const isDone = isSeeder || torrent.progress === 1 || torrent.done;
+      const progressPct = isSeeder ? 100 : Math.round(torrent.progress * 100);
+      const speedMB = (torrent.downloadSpeed / 1024 / 1024).toFixed(2);
+      const fileName = meta.fileName || meta.name || torrent.name;
+
       setActiveTorrents((prev) =>
         prev.map((item) => {
           if (item.infoHash === meta.magnetURI || item.magnetURI === meta.magnetURI) {
             return {
               ...item,
-              progress: isSeeder ? 100 : Math.round(torrent.progress * 100),
-              speed: (torrent.downloadSpeed / 1024 / 1024).toFixed(2),
+              progress: progressPct,
+              speed: speedMB,
               done: isDone
             };
           }
           return item;
         })
       );
+
+      if (!isSeeder && !isDone && progressPct > 0) {
+        setStatusText(`กำลังดาวน์โหลด [${fileName}] (${progressPct}%) - ${speedMB} MB/s ⚡`);
+      } else if (!isSeeder && isDone) {
+        setStatusText(`ดาวน์โหลดไฟล์ [${fileName}] สมบูรณ์ 100%!`);
+      }
 
       // ONLY extract Blob URL once when a downloader finishes — NEVER for seeders on upload ticks
       if (!isSeeder && isDone && !hasExtractedBlob) {
@@ -1471,6 +1491,10 @@ export default function App() {
     try {
       torrent.on('download', updateStats);
       torrent.on('upload', updateStats);
+      torrent.on('wire', (wire) => {
+        const fileName = meta.fileName || meta.name || torrent.name;
+        setStatusText(`เชื่อมต่อโหนด P2P สำหรับ [${fileName}] สำเร็จ! เริ่มถ่ายโอนข้อมูล...`);
+      });
     } catch (e) {}
 
     try {
