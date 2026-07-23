@@ -771,61 +771,64 @@ export default function App() {
     // 10c. Peer requests direct P2P file data stream fallback (32 KB Chunked Stream)
     if (data.type === 'request-direct-p2p-stream' && data.magnetURI) {
       console.log('[P2P Stream]: Received request-direct-p2p-stream for', data.magnetURI);
-      if (torrentClient.current && torrentClient.current.torrents) {
+      
+      let rawFile = null;
+      if (localSeederMap.current) {
+        for (const [key, val] of localSeederMap.current.entries()) {
+          if (key === data.magnetURI || (data.magnetURI && (data.magnetURI.includes(key) || key.includes(data.magnetURI)))) {
+            rawFile = val;
+            break;
+          }
+        }
+      }
+
+      if (!rawFile && torrentClient.current && torrentClient.current.torrents) {
         let torrent = torrentClient.current.get(data.magnetURI);
         if (!torrent) {
           torrent = torrentClient.current.torrents.find(
             t => t.magnetURI === data.magnetURI || t.infoHash === data.magnetURI || (data.magnetURI && data.magnetURI.includes(t.infoHash))
           );
         }
-
         if (torrent && torrent.files && torrent.files[0]) {
-          const file = torrent.files[0];
-          const rawBlob = file._file;
-
-          const sendChunkedBufferPayload = (blobObj) => {
-            if (!blobObj) return;
-            const reader = new FileReader();
-            reader.onload = () => {
-              const fullBase64 = reader.result ? reader.result.toString().split(',')[1] : '';
-              if (!fullBase64) return;
-
-              const CHUNK_SIZE = 32 * 1024; // 32 KB WebRTC DataChannel frame limit
-              const totalChunks = Math.ceil(fullBase64.length / CHUNK_SIZE);
-              const transferId = 'tr_' + Math.random().toString(36).substr(2, 9);
-              console.log(`[P2P Stream]: Sending ${totalChunks} chunks for file ${file.name}`);
-
-              for (let i = 0; i < totalChunks; i++) {
-                const chunkStr = fullBase64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-                const payload = JSON.stringify({
-                  type: 'direct-p2p-file-chunk',
-                  transferId,
-                  magnetURI: data.magnetURI,
-                  fileName: file.name,
-                  chunkIndex: i,
-                  totalChunks,
-                  chunkStr
-                });
-
-                if (peerRef.current && peerRef.current.connected) {
-                  try { peerRef.current.send(payload); } catch (e) {}
-                }
-                if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-                  try { chatWs.current.send(payload); } catch (e) {}
-                }
-              }
-            };
-            reader.readAsDataURL(blobObj);
-          };
-
-          if (rawBlob) {
-            sendChunkedBufferPayload(rawBlob);
-          } else if (typeof file.getBlob === 'function') {
-            try {
-              file.getBlob((err, b) => { if (!err && b) sendChunkedBufferPayload(b); });
-            } catch (e) {}
-          }
+          rawFile = torrent.files[0]._file || torrent.files[0];
         }
+      }
+
+      if (rawFile && (rawFile instanceof Blob || rawFile instanceof File)) {
+        console.log(`[P2P Stream]: Found rawFile ${rawFile.name || 'file'}, converting to chunks...`);
+        const reader = new FileReader();
+        reader.onload = () => {
+          const fullBase64 = reader.result ? reader.result.toString().split(',')[1] : '';
+          if (!fullBase64) return;
+
+          const CHUNK_SIZE = 32 * 1024; // 32 KB WebRTC DataChannel frame limit
+          const totalChunks = Math.ceil(fullBase64.length / CHUNK_SIZE);
+          const transferId = 'tr_' + Math.random().toString(36).substr(2, 9);
+          console.log(`[P2P Stream]: Sending ${totalChunks} chunks for file ${rawFile.name || 'file'}`);
+
+          for (let i = 0; i < totalChunks; i++) {
+            const chunkStr = fullBase64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+            const payload = JSON.stringify({
+              type: 'direct-p2p-file-chunk',
+              transferId,
+              magnetURI: data.magnetURI,
+              fileName: rawFile.name || 'file',
+              chunkIndex: i,
+              totalChunks,
+              chunkStr
+            });
+
+            if (peerRef.current && peerRef.current.connected) {
+              try { peerRef.current.send(payload); } catch (e) {}
+            }
+            if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+              try { chatWs.current.send(payload); } catch (e) {}
+            }
+          }
+        };
+        reader.readAsDataURL(rawFile);
+      } else {
+        console.warn('[P2P Stream]: Could not find raw seeder File object for magnetURI:', data.magnetURI);
       }
       return;
     }
