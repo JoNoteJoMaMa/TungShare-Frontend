@@ -361,6 +361,7 @@ export default function App() {
   const seenMsgIds = useRef(new Set());
   const autoDownloadedBlobs = useRef(new Set());
   const directTransferBuffers = useRef(new Map());
+  const localSeederFiles = useRef(new Map());
 
   // Persistent Identity Token — entirely client-side via localStorage
   // Each room gets its own saved animal so the user appears the same on rejoin
@@ -773,8 +774,8 @@ export default function App() {
       console.log('[P2P Stream]: Received request-direct-p2p-stream for', data.magnetURI);
       
       let rawFile = null;
-      if (localSeederMap.current) {
-        for (const [key, val] of localSeederMap.current.entries()) {
+      if (localSeederFiles.current) {
+        for (const [key, val] of localSeederFiles.current.entries()) {
           if (key === data.magnetURI || (data.magnetURI && (data.magnetURI.includes(key) || key.includes(data.magnetURI)))) {
             rawFile = val;
             break;
@@ -1255,6 +1256,9 @@ export default function App() {
             animalIcon: myAnimal.icon,
             time: timestamp
           };
+
+          localSeederFiles.current.set(torrent.magnetURI, file);
+          if (torrent.infoHash) localSeederFiles.current.set(torrent.infoHash, file);
 
           seenMsgIds.current.add(msgId);
           addTorrentToState(torrent, { ...meta, blobUrl: uploaderBlobUrl }, true);
