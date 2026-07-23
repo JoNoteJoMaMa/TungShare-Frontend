@@ -5,11 +5,7 @@ import './App.css';
 const WebTorrent = WebTorrentModule.default || WebTorrentModule;
 
 // Environment variable support for cloud deployment (Vercel + Render)
-const BASE_SERVER_URL = (import.meta.env.VITE_BACKEND_URL || (
-  window.location.protocol === 'https:'
-    ? `wss://${window.location.host}`
-    : 'ws://localhost:8080'
-)).replace(/\/+$/, ''); // strip any trailing slashes
+const BASE_SERVER_URL = (import.meta.env.VITE_BACKEND_URL || 'wss://tungshare-backend.onrender.com').replace(/\/+$/, '');
 
 const getTrackerUrls = (baseUrl) => {
   const wsUrl = baseUrl.replace(/^http/, 'ws');
