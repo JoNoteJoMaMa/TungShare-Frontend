@@ -616,7 +616,55 @@ html, body, #root {
   border-radius: 14px;
   padding: 14px;
   margin-top: 12px;
+  position: relative;
+  overflow: hidden;
+  transition: opacity 0.3s ease;
 }
+
+/* Unavailable file card — seeder has left the room */
+.file-card-unavailable {
+  opacity: 0.5;
+  filter: grayscale(80%);
+  pointer-events: none;
+}
+
+.file-card-unavailable * {
+  pointer-events: none;
+}
+
+.unavailable-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(10, 10, 20, 0.72);
+  border-radius: 14px;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.unavailable-icon {
+  font-size: 2rem;
+  font-weight: 900;
+  color: #ff4d4d;
+  line-height: 1;
+}
+
+.unavailable-label {
+  font-size: 0.82rem;
+  color: #aaa;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.unavailable-label small {
+  font-size: 0.72rem;
+  color: #777;
+}
+
 
 .file-header {
   display: flex;

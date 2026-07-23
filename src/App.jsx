@@ -311,6 +311,23 @@ export default function App() {
   const seenMsgIds = useRef(new Set());
   const autoDownloadedBlobs = useRef(new Set());
 
+  // Persistent Identity Token — stored in localStorage, same animal on rejoin
+  const MY_USER_ID = useRef((() => {
+    let uid = localStorage.getItem('tungshare_uid');
+    if (!uid) {
+      uid = 'uid_' + Math.random().toString(36).substr(2, 12) + '_' + Date.now().toString(36);
+      localStorage.setItem('tungshare_uid', uid);
+    }
+    return uid;
+  })());
+
+  // Local history for P2P relay to new joiners (Option B)
+  const localHistory = useRef([]); // Array of { type, ...msgData }
+  const MAX_LOCAL_HISTORY = 100;
+
+  // Local seederMap: peerId → Set of magnetURIs (for marking unavailable on disconnect)
+  const localSeederMap = useRef(new Map());
+
   // Listen to screen resize for mobile optimization
   useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth <= 768);
@@ -440,15 +457,16 @@ export default function App() {
     setAuthError('');
     setPinInput('');
 
-    // Assign fresh Thai Animal Identity ONLY upon entering/requesting room!
-    const animalProfile = myAnimal.name ? myAnimal : generateThaiAnimalProfile();
-    setMyAnimal(animalProfile);
+    // Generate a fresh animal identity as proposal (server may override with saved identity)
+    const proposedAnimal = generateThaiAnimalProfile();
+    // Don't set myAnimal yet — wait for server to confirm (may return saved identity)
 
     if (chatWs.current) {
       chatWs.current.close();
     }
 
-    const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&animalName=${encodeURIComponent(animalProfile.name)}&animalIcon=${encodeURIComponent(animalProfile.icon)}`;
+    // Include userId for persistent identity resolution on server
+    const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&userId=${encodeURIComponent(MY_USER_ID.current)}&animalName=${encodeURIComponent(proposedAnimal.name)}&animalIcon=${encodeURIComponent(proposedAnimal.icon)}`;
     chatWs.current = new WebSocket(wsUrl);
 
     chatWs.current.onmessage = (event) => {
@@ -484,14 +502,28 @@ export default function App() {
       }
 
       // 5. Room Joined -> Successfully authenticated & joined
+      // Server returns confirmed animal (may be saved identity from prior visit)
       if (data.type === 'room-joined') {
         setShowCreateModal(false);
         setShowAuthModal(false);
         setRoomName(data.room);
         setJoined(true);
+
+        // Use server-confirmed animal identity (persistent if returning user)
+        const confirmedAnimal = {
+          name: data.animalName || proposedAnimal.name,
+          icon: data.animalIcon || proposedAnimal.icon
+        };
+        setMyAnimal(confirmedAnimal);
+
+        // Reset history and seederMap for new room session
+        localHistory.current = [];
+        localSeederMap.current = new Map();
+        seenMsgIds.current = new Set();
+
         setMessages((prev) => [...prev, {
           sender: 'system',
-          text: `คุณเข้าสู่ห้อง [${data.room}] ในฐานะ ${animalProfile.icon} ${animalProfile.name}`,
+          text: `คุณเข้าสู่ห้อง [${data.room}] ในฐานะ ${confirmedAnimal.icon} ${confirmedAnimal.name}`,
           time: getCurrentTimeStr()
         }]);
         
@@ -526,7 +558,7 @@ export default function App() {
         return;
       }
 
-      // 9. Peer left event
+      // 9. Peer left event — mark their files as unavailable
       if (data.type === 'peer-left') {
         setPeerConnected(false);
         setHasOtherPeers(false);
@@ -538,10 +570,60 @@ export default function App() {
           peerRef.current.destroy();
           peerRef.current = null;
         }
+        // Mark files from this peer as unavailable
+        const deadMagnets = data.deadMagnets || [];
+        if (deadMagnets.length > 0) {
+          setActiveTorrents((prev) => prev.map((t) =>
+            deadMagnets.includes(t.magnetURI) ? { ...t, unavailable: true } : t
+          ));
+        }
         return;
       }
 
-      // 10. Chat or WebTorrent Metadata Signaling
+      // 10. Server asks THIS peer to relay history to a new joiner (Option B)
+      if (data.type === 'request-history') {
+        const targetPeerId = data.targetPeerId;
+        if (targetPeerId && chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+          chatWs.current.send(JSON.stringify({
+            type: 'room-history',
+            targetPeerId,
+            messages: localHistory.current
+          }));
+        }
+        return;
+      }
+
+      // 11. Receiving room history from an existing peer (Option B)
+      if (data.type === 'room-history') {
+        const historyMessages = data.messages || [];
+        historyMessages.forEach((msg) => {
+          if (msg.msgId && seenMsgIds.current.has(msg.msgId)) return;
+          if (msg.msgId) seenMsgIds.current.add(msg.msgId);
+
+          if (msg.type === 'chat') {
+            setMessages((prev) => [...prev, {
+              sender: 'peer',
+              text: msg.text,
+              time: msg.time || '',
+              animalName: msg.animalName || 'เพื่อน P2P',
+              animalIcon: msg.animalIcon || '🐾',
+              fromHistory: true
+            }]);
+          } else if (msg.type === 'torrent-meta') {
+            registerIncomingTorrentCard(msg);
+            // Rebuild seederMap from history
+            if (msg.senderPeerId && msg.magnetURI) {
+              if (!localSeederMap.current.has(msg.senderPeerId)) {
+                localSeederMap.current.set(msg.senderPeerId, new Set());
+              }
+              localSeederMap.current.get(msg.senderPeerId).add(msg.magnetURI);
+            }
+          }
+        });
+        return;
+      }
+
+      // 12. Chat or WebTorrent Metadata Signaling
       if (data.type === 'chat' || data.type === 'torrent-meta') {
         handleIncomingMessage(data);
         return;
@@ -664,9 +746,26 @@ export default function App() {
       };
       setMessages((prev) => [...prev, msgObj]);
       syncChannel.current?.postMessage({ type: 'chat-sync', payload: msgObj, msgId: payload.msgId });
+
+      // Add to local history for relay to future joiners
+      localHistory.current.push({ ...payload, type: 'chat' });
+      if (localHistory.current.length > MAX_LOCAL_HISTORY) localHistory.current.shift();
+
     } else if (payload.type === 'torrent-meta') {
       registerIncomingTorrentCard(payload);
       syncChannel.current?.postMessage(payload);
+
+      // Track seeder in local seederMap
+      if (payload.senderPeerId && payload.magnetURI) {
+        if (!localSeederMap.current.has(payload.senderPeerId)) {
+          localSeederMap.current.set(payload.senderPeerId, new Set());
+        }
+        localSeederMap.current.get(payload.senderPeerId).add(payload.magnetURI);
+      }
+
+      // Add to local history for relay to future joiners
+      localHistory.current.push({ ...payload, type: 'torrent-meta' });
+      if (localHistory.current.length > MAX_LOCAL_HISTORY) localHistory.current.shift();
     }
   };
 
@@ -1451,7 +1550,15 @@ export default function App() {
                 {/* Active BitTorrent File Transfers Scrollable Container */}
                 <div className="file-list-container" onScroll={handleFileScroll}>
                   {activeTorrents.map((t) => (
-                    <div key={t.infoHash || t.magnetURI} className="file-card">
+                    <div key={t.infoHash || t.magnetURI} className={`file-card${t.unavailable ? ' file-card-unavailable' : ''}`}>
+                      {/* Unavailable overlay when seeder has left */}
+                      {t.unavailable && (
+                        <div className="unavailable-overlay">
+                          <span className="unavailable-icon">✕</span>
+                          <span className="unavailable-label">ไฟล์นี้ไม่พร้อมใช้งาน<br/><small>เจ้าของออกจากห้องแล้ว</small></span>
+                        </div>
+                      )}
+
                       <div className="file-header">
                         <div className="file-name" title={t.name}>{t.name}</div>
                         <div className="file-meta">{formatBytes(t.size)}</div>
@@ -1461,8 +1568,8 @@ export default function App() {
                         ผู้ส่ง: <strong>{t.animalIcon} {t.animalName}</strong>
                       </div>
 
-                      {/* Show Start Download Button if not started yet */}
-                      {!t.isSeeder && !t.started && !t.done && (
+                      {/* Show Start Download Button if not started yet and not unavailable */}
+                      {!t.isSeeder && !t.started && !t.done && !t.unavailable && (
                         <div style={{ marginTop: 10 }}>
                           <button
                             className="primary-btn"
@@ -1518,6 +1625,7 @@ export default function App() {
                         </div>
                       )}
                     </div>
+
                   ))}
                   <div ref={fileBottomRef} />
                 </div>
