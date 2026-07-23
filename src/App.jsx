@@ -770,6 +770,7 @@ export default function App() {
 
     // 10c. Peer requests direct P2P file data stream fallback (32 KB Chunked Stream)
     if (data.type === 'request-direct-p2p-stream' && data.magnetURI) {
+      console.log('[P2P Stream]: Received request-direct-p2p-stream for', data.magnetURI);
       if (torrentClient.current && torrentClient.current.torrents) {
         let torrent = torrentClient.current.get(data.magnetURI);
         if (!torrent) {
@@ -792,6 +793,7 @@ export default function App() {
               const CHUNK_SIZE = 32 * 1024; // 32 KB WebRTC DataChannel frame limit
               const totalChunks = Math.ceil(fullBase64.length / CHUNK_SIZE);
               const transferId = 'tr_' + Math.random().toString(36).substr(2, 9);
+              console.log(`[P2P Stream]: Sending ${totalChunks} chunks for file ${file.name}`);
 
               for (let i = 0; i < totalChunks; i++) {
                 const chunkStr = fullBase64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);

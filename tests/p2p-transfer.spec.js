@@ -27,12 +27,14 @@ test.describe('TungShare P2P Multi-Device Integration Tests', () => {
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     });
     const desktopPage = await desktopContext.newPage();
+    desktopPage.on('console', msg => console.log('[Desktop Console]:', msg.text()));
 
     // 2. Create Mobile Browser Context (iPhone 14 viewport + Mobile User-Agent)
     const mobileContext = await browser.newContext({
       ...devices['iPhone 14'],
     });
     const mobilePage = await mobileContext.newPage();
+    mobilePage.on('console', msg => console.log('[Mobile Console]:', msg.text()));
     await mobilePage.addInitScript(() => {
       delete window.showSaveFilePicker;
     });
