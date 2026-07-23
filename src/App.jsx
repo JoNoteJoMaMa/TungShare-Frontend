@@ -816,7 +816,12 @@ export default function App() {
     revokeAllBlobUrls();
 
     if (chatWs.current) {
-      chatWs.current.close();
+      if (chatWs.current.readyState === WebSocket.OPEN) {
+        try {
+          chatWs.current.send(JSON.stringify({ type: 'leave-room' }));
+        } catch (e) {}
+      }
+      try { chatWs.current.close(); } catch (e) {}
       chatWs.current = null;
     }
     if (peerRef.current) {
