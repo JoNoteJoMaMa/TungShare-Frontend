@@ -198,6 +198,7 @@ class NativePeer {
     this.onSignal = onSignal;
     this.connected = false;
     this.destroyed = false;
+    this.pendingCandidates = [];
 
     this.pc = new RTCPeerConnection(config);
 
@@ -241,13 +242,27 @@ class NativePeer {
     };
   }
 
+  _flushPendingCandidates() {
+    while (this.pendingCandidates && this.pendingCandidates.length > 0) {
+      const cand = this.pendingCandidates.shift();
+      try {
+        if (cand && this.pc && this.pc.remoteDescription) {
+          this.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+        }
+      } catch (e) {}
+    }
+  }
+
   signal(data) {
     if (this.destroyed || !data) return;
     try {
       if (data.type === 'offer') {
         if (this.pc.signalingState !== 'stable' && this.pc.signalingState !== 'have-local-offer') return;
         this.pc.setRemoteDescription(new RTCSessionDescription(data))
-          .then(() => this.pc.createAnswer())
+          .then(() => {
+            this._flushPendingCandidates();
+            return this.pc.createAnswer();
+          })
           .then((answer) => this.pc.setLocalDescription(answer))
           .then(() => {
             if (this.onSignal) this.onSignal(this.pc.localDescription);
@@ -257,13 +272,18 @@ class NativePeer {
         // Prevent "Failed to set remote answer sdp: Called in wrong state: stable"
         if (this.pc.signalingState === 'have-local-offer') {
           this.pc.setRemoteDescription(new RTCSessionDescription(data))
+            .then(() => this._flushPendingCandidates())
             .catch((err) => console.warn('Answer signal err:', err));
         }
       } else if (data.candidate || data.type === 'candidate') {
         const cand = data.candidate || data;
-        if (cand && cand.candidate && this.pc.remoteDescription) {
-          this.pc.addIceCandidate(new RTCIceCandidate(cand))
-            .catch((err) => console.warn('Candidate err:', err));
+        if (cand && cand.candidate) {
+          if (this.pc.remoteDescription) {
+            this.pc.addIceCandidate(new RTCIceCandidate(cand))
+              .catch((err) => console.warn('Candidate err:', err));
+          } else {
+            this.pendingCandidates.push(cand);
+          }
         }
       }
     } catch (e) {
