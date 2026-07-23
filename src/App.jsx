@@ -454,11 +454,21 @@ export default function App() {
 
     // 1. Browser Tab Close / Refresh Guard
     const handleBeforeUnload = (e) => {
+      if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+        try { chatWs.current.send(JSON.stringify({ type: 'leave-room' })); } catch (e) {}
+      }
       e.preventDefault();
       e.returnValue = 'คุณมีเซสชั่นห้องแชต P2P และไฟล์ที่กำลังเชื่อมต่ออยู่ ต้องการออกจากหน้าเว็บหรือไม่?';
       return e.returnValue;
     };
+    const handleUnloadSignal = () => {
+      if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+        try { chatWs.current.send(JSON.stringify({ type: 'leave-room' })); } catch (e) {}
+      }
+    };
     window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleUnloadSignal);
+    window.addEventListener('unload', handleUnloadSignal);
 
     // 2. Mobile & Browser Back Button Interception
     window.history.pushState({ inRoom: true }, '', window.location.href);
@@ -471,6 +481,8 @@ export default function App() {
 
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleUnloadSignal);
+      window.removeEventListener('unload', handleUnloadSignal);
       window.removeEventListener('popstate', handlePopState);
     };
   }, [joined]);
