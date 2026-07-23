@@ -244,9 +244,7 @@ class NativePeer {
     if (this.destroyed || !data) return;
     try {
       if (data.type === 'offer') {
-        if (this.pc.signalingState !== 'stable' && this.pc.signalingState !== 'have-local-offer') {
-          return;
-        }
+        if (this.pc.signalingState !== 'stable' && this.pc.signalingState !== 'have-local-offer') return;
         this.pc.setRemoteDescription(new RTCSessionDescription(data))
           .then(() => this.pc.createAnswer())
           .then((answer) => this.pc.setLocalDescription(answer))
@@ -255,15 +253,14 @@ class NativePeer {
           })
           .catch((err) => console.warn('Offer signal err:', err));
       } else if (data.type === 'answer') {
-        // Only set remote answer if we are waiting for an answer (have-local-offer)
-        if (this.pc.signalingState !== 'have-local-offer') {
-          return; // Ignore redundant answer when state is already stable
+        // Prevent "Failed to set remote answer sdp: Called in wrong state: stable"
+        if (this.pc.signalingState === 'have-local-offer') {
+          this.pc.setRemoteDescription(new RTCSessionDescription(data))
+            .catch((err) => console.warn('Answer signal err:', err));
         }
-        this.pc.setRemoteDescription(new RTCSessionDescription(data))
-          .catch((err) => console.warn('Answer signal err:', err));
       } else if (data.candidate || data.type === 'candidate') {
         const cand = data.candidate || data;
-        if (cand && cand.candidate) {
+        if (cand && cand.candidate && this.pc.remoteDescription) {
           this.pc.addIceCandidate(new RTCIceCandidate(cand))
             .catch((err) => console.warn('Candidate err:', err));
         }
@@ -1133,9 +1130,9 @@ export default function App() {
     setStatusText(`มีไฟล์ใหม่จาก ${meta.animalIcon || '📦'} ${meta.animalName || 'เพื่อน'} [${meta.fileName}]`);
   };
 
-  // Direct-to-Disk P2P WebTorrent Download
+  // Instant P2P WebTorrent Download (Starts immediately in memory/WebRTC, no blocking path picker)
   const startDownload = (meta) => {
-    const fileName = meta.name || meta.fileName || 'download';
+    if (!meta || !meta.magnetURI) return;
 
     setActiveTorrents((prev) =>
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
@@ -1143,7 +1140,7 @@ export default function App() {
 
     if (!torrentClient.current) return;
 
-    setStatusText(`กำลังดาวน์โหลดไฟล์ [${fileName}]...`);
+    setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อดาวน์โหลด [${meta.name || meta.fileName}]...`);
 
     const setupTorrent = (torrent) => {
       if (!torrent || typeof torrent.on !== 'function') return;
@@ -1155,13 +1152,7 @@ export default function App() {
       if (existingTorrent && typeof existingTorrent.on === 'function') {
         setupTorrent(existingTorrent);
       } else {
-        const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-        const addOptions = {
-          announce: TRACKER_URLS,
-          maxConns: isMobileDevice ? 2 : 55
-        };
-
-        const addedTorrent = torrentClient.current.add(meta.magnetURI, addOptions, (torrent) => {
+        const addedTorrent = torrentClient.current.add(meta.magnetURI, { announce: TRACKER_URLS }, (torrent) => {
           setupTorrent(torrent);
         });
 
