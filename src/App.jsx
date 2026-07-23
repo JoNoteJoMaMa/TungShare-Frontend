@@ -1199,38 +1199,47 @@ export default function App() {
 
   // Direct-to-Disk P2P WebTorrent Download (OPFS / FileSystem Access for 0 MB RAM)
   const startDownload = async (meta) => {
-    if (!meta || !meta.magnetURI) return;
+    if (!meta || !meta.magnetURI || !torrentClient.current) return;
+
+    const fileName = meta.name || meta.fileName || 'download';
 
     setActiveTorrents((prev) =>
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
     );
 
-    // Pulse request-init and request-torrent-reannounce over WebSocket
+    // 1. Register torrent synchronously in WebTorrent client FIRST so it is immediately listening
+    let torrent = torrentClient.current.get(meta.magnetURI);
+    if (!torrent) {
+      try {
+        torrent = torrentClient.current.add(meta.magnetURI, { announce: TRACKER_URLS });
+      } catch (e) {
+        console.warn('WebTorrent add error handled:', e);
+      }
+    }
+
+    if (torrent && typeof torrent.on === 'function') {
+      attachTorrentListeners(torrent, meta, false);
+      torrent.on('error', (err) => {
+        console.error('Torrent download error:', err);
+        setStatusText(`[Download Error]: ${err.message}`);
+      });
+    }
+
+    // 2. Pulse request-init and request-torrent-reannounce over WebSocket AFTER registering torrent
     if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
       chatWs.current.send(JSON.stringify({ type: 'request-init' }));
       chatWs.current.send(JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI }));
     }
 
-    const fileName = meta.name || meta.fileName || 'download';
-    let diskTarget = await getDiskWritableStream(fileName);
+    setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อสตรีมไฟล์ [${fileName}]...`);
 
-    if (!torrentClient.current) return;
-
-    if (diskTarget && diskTarget.stream) {
-      const modeLabel = diskTarget.mode === 'picker' ? 'ดิสก์เครื่อง' : 'OPFS Flash Storage';
-      setStatusText(`เปิดสตรีมตรงลงดิสก์ (${modeLabel}) สำหรับ [${fileName}] สำเร็จ! (0 MB RAM)`);
-    } else {
-      setStatusText(`กำลังสตรีมไฟล์ P2P สำหรับ [${fileName}]...`);
-    }
-
-    const setupTorrent = (torrent) => {
-      if (!torrent || typeof torrent.on !== 'function') return;
-
-      if (diskTarget && diskTarget.stream) {
+    // 3. Asynchronously acquire physical disk writable stream (OPFS or picker) without delaying P2P handshake
+    getDiskWritableStream(fileName).then((diskTarget) => {
+      if (diskTarget && diskTarget.stream && torrent && typeof torrent.on === 'function') {
         torrent._hasDirectDiskStream = (diskTarget.mode === 'picker');
         torrent._opfsDiskTarget = (diskTarget.mode === 'opfs' ? diskTarget : null);
 
-        torrent.on('ready', () => {
+        const attachStream = () => {
           const file = torrent.files && torrent.files[0];
           if (file && typeof file.createReadStream === 'function') {
             const stream = file.createReadStream();
@@ -1244,32 +1253,15 @@ export default function App() {
               } catch (e) {}
             });
           }
-        });
-      }
+        };
 
-      attachTorrentListeners(torrent, meta, false);
-    };
-
-    try {
-      let existingTorrent = torrentClient.current.get(meta.magnetURI);
-      if (existingTorrent && typeof existingTorrent.on === 'function') {
-        setupTorrent(existingTorrent);
-      } else {
-        const addedTorrent = torrentClient.current.add(meta.magnetURI, { announce: TRACKER_URLS }, (torrent) => {
-          setupTorrent(torrent);
-        });
-
-        if (addedTorrent && typeof addedTorrent.on === 'function') {
-          setupTorrent(addedTorrent);
-          addedTorrent.on('error', (err) => {
-            console.error('Torrent download error:', err);
-            setStatusText(`[Download Error]: ${err.message}`);
-          });
+        if (torrent.files && torrent.files.length > 0) {
+          attachStream();
+        } else {
+          torrent.on('ready', attachStream);
         }
       }
-    } catch (err) {
-      console.warn('WebTorrent add error handled:', err);
-    }
+    });
   };
 
   const addTorrentToState = (torrent, meta, isSeeder) => {
