@@ -344,10 +344,13 @@ export default function App() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Initialize WebTorrent Client once with error logging
+  // Initialize WebTorrent Client once with error logging & mobile memory limits
   useEffect(() => {
     try {
-      torrentClient.current = new WebTorrent();
+      const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+      torrentClient.current = new WebTorrent({
+        maxConns: isMobileDevice ? 2 : 55
+      });
       torrentClient.current.on('error', (err) => {
         console.error('WebTorrent client error:', err);
         setStatusText(`[WebTorrent Error]: ${err.message}`);
@@ -940,7 +943,8 @@ export default function App() {
         const isMobileDevice = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
         const seedOptions = {
           announce: TRACKER_URLS,
-          ...(isMobileDevice ? { uploadThrottle: 512 * 1024 } : {})
+          maxConns: isMobileDevice ? 2 : 55,
+          ...(isMobileDevice ? { pieceLength: 128 * 1024 } : {})
         };
 
         const seedingTorrent = torrentClient.current.seed(file, seedOptions, (torrent) => {
@@ -972,8 +976,6 @@ export default function App() {
 
           // Release wake lock when the torrent is fully seeded to all peers
           torrent.on('idle', () => {
-            // 'idle' fires when all connected peers have finished downloading
-            // Only release if no other torrents are still actively uploading
             if (torrentClient.current && !torrentClient.current.torrents.some(t => t.uploadSpeed > 0)) {
               releaseWakeLock();
             }
@@ -981,6 +983,31 @@ export default function App() {
         });
 
         if (seedingTorrent && seedingTorrent.on) {
+          // Monitor every peer wire connected to this seeding torrent for DataChannel backpressure
+          seedingTorrent.on('wire', (wire) => {
+            const checkWireBackpressure = () => {
+              const channel = wire.conn || wire._channel || (wire.peer && wire.peer._channel) || (wire.type === 'webrtc' && wire.socket);
+              if (channel && typeof channel.bufferedAmount === 'number') {
+                // High watermark: 256KB buffer -> pause wire stream (stops reading File & queueing data)
+                if (channel.bufferedAmount > 256 * 1024) {
+                  if (!wire._isPausedForBackpressure) {
+                    wire._isPausedForBackpressure = true;
+                    if (typeof wire.pause === 'function') wire.pause();
+                  }
+                }
+                // Low watermark: 64KB buffer -> resume wire stream
+                else if (wire._isPausedForBackpressure && channel.bufferedAmount < 64 * 1024) {
+                  wire._isPausedForBackpressure = false;
+                  if (typeof wire.resume === 'function') wire.resume();
+                }
+              }
+            };
+
+            const bpInterval = setInterval(checkWireBackpressure, 50);
+            wire.on('close', () => clearInterval(bpInterval));
+            wire.on('error', () => clearInterval(bpInterval));
+          });
+
           seedingTorrent.on('error', (err) => {
             console.error('Seeding torrent error:', err);
             setStatusText(`[Seed Error]: ${err.message}`);
