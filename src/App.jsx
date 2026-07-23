@@ -23,6 +23,23 @@ const getTrackerUrls = (baseUrl) => {
 
 const TRACKER_URLS = getTrackerUrls(BASE_SERVER_URL);
 
+// High-availability STUN + TURN Relay Fallbacks (Ensures WebRTC connections on cellular 4G/5G, campus & corporate Wi-Fi)
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:global.stun.twilio.com:3478' },
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp'
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  }
+];
+
 // 100 Thai Animals with accurate Emojis
 const THAI_ANIMALS = [
   { name: 'สุนัขจิ้งจอก', icon: '🦊' },
@@ -337,6 +354,25 @@ export default function App() {
   // Local seederMap: peerId → Set of magnetURIs (for marking unavailable on disconnect)
   const localSeederMap = useRef(new Map());
 
+  // Blob URL memory management (Optimization 1)
+  const createdBlobUrls = useRef(new Set());
+  const trackBlobUrl = (url) => {
+    if (url && typeof url === 'string' && url.startsWith('blob:')) {
+      createdBlobUrls.current.add(url);
+    }
+    return url;
+  };
+  const revokeAllBlobUrls = () => {
+    createdBlobUrls.current.forEach((url) => {
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    });
+    createdBlobUrls.current.clear();
+  };
+
+  // Keep myAnimalRef in sync for async callbacks
+  const myAnimalRef = useRef(myAnimal);
+  useEffect(() => { myAnimalRef.current = myAnimal; }, [myAnimal]);
+
   // Listen to screen resize for mobile optimization
   useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth <= 768);
@@ -344,12 +380,13 @@ export default function App() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Initialize WebTorrent Client once with error logging & mobile memory limits
+  // Initialize WebTorrent Client once with error logging, mobile memory limits & TURN fallback
   useEffect(() => {
     try {
       const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
       torrentClient.current = new WebTorrent({
-        maxConns: isMobileDevice ? 2 : 55
+        maxConns: isMobileDevice ? 2 : 55,
+        tracker: { rtcConfig: { iceServers: ICE_SERVERS } }
       });
       torrentClient.current.on('error', (err) => {
         console.error('WebTorrent client error:', err);
@@ -362,11 +399,12 @@ export default function App() {
       if (torrentClient.current) {
         try { torrentClient.current.destroy(); } catch (e) {}
       }
-      // Release wake lock on unmount
+      // Release wake lock and revoke Blob URLs on unmount
       if (wakeLock.current) {
         try { wakeLock.current.release(); } catch (e) {}
         wakeLock.current = null;
       }
+      revokeAllBlobUrls();
     };
   }, []);
 
@@ -587,7 +625,7 @@ export default function App() {
       return;
     }
 
-    // 9. Peer left event — mark their files as unavailable
+    // 9. Peer left event — check for Swarm Promotion or mark as unavailable
     if (data.type === 'peer-left') {
       setPeerConnected(false);
       setHasOtherPeers(false);
@@ -599,12 +637,41 @@ export default function App() {
         peerRef.current.destroy();
         peerRef.current = null;
       }
-      // Mark files from this peer as unavailable
+      
       const deadMagnets = data.deadMagnets || [];
       if (deadMagnets.length > 0) {
-        setActiveTorrents((prev) => prev.map((t) =>
-          deadMagnets.includes(t.magnetURI) ? { ...t, unavailable: true } : t
-        ));
+        setActiveTorrents((prev) => prev.map((t) => {
+          if (deadMagnets.includes(t.magnetURI)) {
+            // Swarm Promotion (Optimization 2): If WE already downloaded 100% of this file, promote ourselves to Seeder!
+            if (t.done || t.progress === 100) {
+              const currentAnimal = myAnimalRef.current;
+              const reseedMeta = {
+                type: 'torrent-meta',
+                msgId: 'reseed_' + Math.random().toString(36).substr(2, 9),
+                magnetURI: t.magnetURI,
+                fileName: t.name,
+                fileSize: t.size,
+                fileType: t.type,
+                animalName: currentAnimal.name || 'เพื่อน P2P',
+                animalIcon: currentAnimal.icon || '🌱',
+                time: getCurrentTimeStr()
+              };
+              // Re-announce our seeder presence to the room
+              if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+                chatWs.current.send(JSON.stringify(reseedMeta));
+              }
+              return {
+                ...t,
+                isSeeder: true,
+                unavailable: false,
+                animalName: currentAnimal.name || t.animalName,
+                animalIcon: currentAnimal.icon || t.animalIcon
+              };
+            }
+            return { ...t, unavailable: true };
+          }
+          return t;
+        }));
       }
       return;
     }
@@ -723,6 +790,9 @@ export default function App() {
     setHasOtherPeers(false);
     setMyAnimal({ name: '', icon: '' });
     setStatusText('พร้อมเข้าใช้งานห้องแชต');
+
+    // Revoke memory allocations
+    revokeAllBlobUrls();
 
     if (chatWs.current) {
       chatWs.current.close();
@@ -857,11 +927,7 @@ export default function App() {
       peerRef.current = new NativePeer({
         initiator: initiator,
         config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' }
-          ]
+          iceServers: ICE_SERVERS
         },
         onSignal: (data) => {
           if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
@@ -937,7 +1003,7 @@ export default function App() {
 
     fileList.forEach((file) => {
       const fileType = file.type || getFallbackFileType(file.name);
-      const uploaderBlobUrl = URL.createObjectURL(file);
+      const uploaderBlobUrl = trackBlobUrl(URL.createObjectURL(file));
 
       if (!torrentClient.current) return;
 
@@ -1199,10 +1265,10 @@ export default function App() {
     if (typeof file.getBlob === 'function') {
       try {
         const res = file.getBlob((err, blob) => {
-          if (!err && blob) callback(URL.createObjectURL(blob));
+          if (!err && blob) callback(trackBlobUrl(URL.createObjectURL(blob)));
         });
         if (res && typeof res.then === 'function') {
-          res.then((blob) => blob && callback(URL.createObjectURL(blob))).catch(() => {});
+          res.then((blob) => blob && callback(trackBlobUrl(URL.createObjectURL(blob)))).catch(() => {});
           return;
         }
       } catch (e) {}
@@ -1210,7 +1276,7 @@ export default function App() {
 
     if (typeof file.blob === 'function') {
       try {
-        file.blob().then((blob) => blob && callback(URL.createObjectURL(blob))).catch(() => {});
+        file.blob().then((blob) => blob && callback(trackBlobUrl(URL.createObjectURL(blob)))).catch(() => {});
         return;
       } catch (e) {}
     }

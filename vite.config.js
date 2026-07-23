@@ -4,8 +4,19 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-    define: {
+  define: {
     // จำลองตัวแปร global และ Buffer ของ Node.js ให้ใช้งานบนบราวเซอร์ได้
     global: 'globalThis',
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            return 'vendor';
+          }
+        }
+      }
+    }
   }
 })
