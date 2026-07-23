@@ -267,6 +267,7 @@ export default function App() {
   const [roomInput, setRoomInput] = useState('');
   const [roomName, setRoomName] = useState('');
   const [joined, setJoined] = useState(false);
+  const joinedRef = useRef(false); // Ref mirror of joined for use inside WS closures
   const [messages, setMessages] = useState([]);
   const [peerConnected, setPeerConnected] = useState(false);
   const [hasOtherPeers, setHasOtherPeers] = useState(false);
@@ -457,6 +458,200 @@ export default function App() {
     fileBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  // Keep joinedRef in sync with joined state
+  useEffect(() => { joinedRef.current = joined; }, [joined]);
+
+  // Silent WebSocket reconnect — used when heartbeat drops us (not triggered by user action)
+  // Skips all modal flows, just re-opens the WS and re-syncs room state
+  const requestJoinRoomReconnect = (targetRoom, resolvedAnimal) => {
+    if (chatWs.current) {
+      try { chatWs.current.close(); } catch (e) {}
+    }
+    const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&animalName=${encodeURIComponent(resolvedAnimal.name)}&animalIcon=${encodeURIComponent(resolvedAnimal.icon)}`;
+    chatWs.current = new WebSocket(wsUrl);
+
+    chatWs.current.onclose = (e) => {
+      if (e.wasClean) return;
+      if (!joinedRef.current) return;
+      console.warn('[WS]: Reconnect dropped again, retrying in 3s...');
+      setTimeout(() => {
+        if (joinedRef.current) requestJoinRoomReconnect(targetRoom, resolvedAnimal);
+      }, 3000);
+    };
+
+    chatWs.current.onmessage = (event) => {
+      let data;
+      try { data = JSON.parse(event.data); } catch (e) { return; }
+      // On reconnect the server may send room-not-found or room-joined
+      if (data.type === 'room-joined') {
+        setStatusText(`เชื่อมต่อห้องใหม่สำเร็จ ✅`);
+        chatWs.current.send(JSON.stringify({ type: 'request-init' }));
+        // Rebind the full message handler for ongoing messages
+        chatWs.current.onmessage = fullMessageHandler;
+      } else if (data.type === 'room-not-found') {
+        // Room disappeared (everyone left) — create it again
+        chatWs.current.send(JSON.stringify({ type: 'create-room', password: null }));
+      }
+    };
+  };
+
+  const fullMessageHandler = (event) => {
+    let data;
+    try { data = JSON.parse(event.data); } catch (e) { return; }
+
+    // 1. Room Full Error (Limit 100 users per room)
+    if (data.type === 'room-full') {
+      alert(data.reason || 'ห้องนี้มีสมาชิกครบโควต้า 100 คนแล้ว ไม่สามารถเข้าร่วมได้');
+      cancelPendingModal();
+      return;
+    }
+
+    // 2. Room Not Found -> Show Create Room Modal (Optionally set 4-digit PIN)
+    if (data.type === 'room-not-found') {
+      setShowCreateModal(true);
+      setShowAuthModal(false);
+      return;
+    }
+
+    // 3. Auth Required -> Show Password Prompt Modal (4-digit PIN)
+    if (data.type === 'auth-required') {
+      setShowAuthModal(true);
+      setShowCreateModal(false);
+      setAuthError(data.reason || 'กรุณากรอกรหัสผ่าน 4 หลัก');
+      return;
+    }
+
+    // 4. Auth Failed -> Update Error text in Modal
+    if (data.type === 'auth-failed') {
+      setAuthError(data.reason || 'รหัสผ่าน 4 หลักไม่ถูกต้อง');
+      return;
+    }
+
+    // 5. Room Joined -> Successfully authenticated & joined
+    if (data.type === 'room-joined') {
+      setShowCreateModal(false);
+      setShowAuthModal(false);
+      setRoomName(data.room);
+      setJoined(true);
+
+      // myAnimal is already set from localStorage before WS connected
+      // Just reset history state for this new session
+      localHistory.current = [];
+      localSeederMap.current = new Map();
+      seenMsgIds.current = new Set();
+
+      // We rely on the identity set during requestJoinRoom (from localStorage)
+      setMessages((prev) => [...prev, {
+        sender: 'system',
+        text: `คุณเข้าสู่ห้อง [${data.room}]`,
+        time: getCurrentTimeStr()
+      }]);
+      
+      if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+        chatWs.current.send(JSON.stringify({ type: 'request-init' }));
+      }
+      return;
+    }
+
+    // 6. Live Room Status Update from Server (Includes Animal Members List)
+    if (data.type === 'room-status') {
+      setHasOtherPeers(data.hasOtherPeers);
+      if (data.members) setRoomMembers(data.members);
+      return;
+    }
+
+    // 7. System initiation signal
+    if (data.type === 'system-init') {
+      if (data.hasOtherPeers) setHasOtherPeers(true);
+      if (data.isInitiator) initWebRTC(true);
+      return;
+    }
+
+    // 8. Peer joined event
+    if (data.type === 'peer-joined') {
+      setHasOtherPeers(true);
+      const peerIdentity = (data.animalName && data.animalName !== 'undefined')
+        ? `${data.animalIcon || '🐾'} ${data.animalName}`
+        : 'เพื่อนใหม่';
+      setMessages((prev) => [...prev, { sender: 'system', text: `มี ${peerIdentity} เข้ามาในห้อง`, time: getCurrentTimeStr() }]);
+      return;
+    }
+
+    // 9. Peer left event — mark their files as unavailable
+    if (data.type === 'peer-left') {
+      setPeerConnected(false);
+      setHasOtherPeers(false);
+      const peerIdentity = (data.animalName && data.animalName !== 'undefined')
+        ? `${data.animalIcon || '🐾'} ${data.animalName}`
+        : 'เพื่อน';
+      setMessages((prev) => [...prev, { sender: 'system', text: `${peerIdentity} ออกจากห้องแล้ว`, time: getCurrentTimeStr() }]);
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+      }
+      // Mark files from this peer as unavailable
+      const deadMagnets = data.deadMagnets || [];
+      if (deadMagnets.length > 0) {
+        setActiveTorrents((prev) => prev.map((t) =>
+          deadMagnets.includes(t.magnetURI) ? { ...t, unavailable: true } : t
+        ));
+      }
+      return;
+    }
+
+    // 10. Server asks THIS peer to relay history to a new joiner (Option B)
+    if (data.type === 'request-history') {
+      const targetPeerId = data.targetPeerId;
+      if (targetPeerId && chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+        chatWs.current.send(JSON.stringify({
+          type: 'room-history',
+          targetPeerId,
+          messages: localHistory.current
+        }));
+      }
+      return;
+    }
+
+    // 11. Receiving room history from an existing peer (Option B)
+    if (data.type === 'room-history') {
+      const historyMessages = data.messages || [];
+      historyMessages.forEach((msg) => {
+        if (msg.msgId && seenMsgIds.current.has(msg.msgId)) return;
+        if (msg.msgId) seenMsgIds.current.add(msg.msgId);
+
+        if (msg.type === 'chat') {
+          setMessages((prev) => [...prev, {
+            sender: 'peer',
+            text: msg.text,
+            time: msg.time || '',
+            animalName: msg.animalName || 'เพื่อน P2P',
+            animalIcon: msg.animalIcon || '🐾',
+            fromHistory: true
+          }]);
+        } else if (msg.type === 'torrent-meta') {
+          registerIncomingTorrentCard(msg);
+          // Rebuild seederMap from history
+          if (msg.senderPeerId && msg.magnetURI) {
+            if (!localSeederMap.current.has(msg.senderPeerId)) {
+              localSeederMap.current.set(msg.senderPeerId, new Set());
+            }
+            localSeederMap.current.get(msg.senderPeerId).add(msg.magnetURI);
+          }
+        }
+      });
+      return;
+    }
+
+    // 12. Chat or WebTorrent Metadata Signaling
+    if (data.type === 'chat' || data.type === 'torrent-meta') {
+      handleIncomingMessage(data);
+      return;
+    }
+
+    // 11. WebRTC Signaling (Offers, Answers, ICE Candidates)
+    handleWebRTCSignal(data);
+  };
+
   // Handle Room Join Request & Password Check
   const requestJoinRoom = () => {
     const targetRoom = roomInput.trim();
@@ -478,161 +673,18 @@ export default function App() {
     const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&animalName=${encodeURIComponent(resolvedAnimal.name)}&animalIcon=${encodeURIComponent(resolvedAnimal.icon)}`;
     chatWs.current = new WebSocket(wsUrl);
 
-    chatWs.current.onmessage = (event) => {
-      let data;
-      try { data = JSON.parse(event.data); } catch (e) { return; }
-
-      // 1. Room Full Error (Limit 100 users per room)
-      if (data.type === 'room-full') {
-        alert(data.reason || 'ห้องนี้มีสมาชิกครบโควต้า 100 คนแล้ว ไม่สามารถเข้าร่วมได้');
-        cancelPendingModal();
-        return;
-      }
-
-      // 2. Room Not Found -> Show Create Room Modal (Optionally set 4-digit PIN)
-      if (data.type === 'room-not-found') {
-        setShowCreateModal(true);
-        setShowAuthModal(false);
-        return;
-      }
-
-      // 3. Auth Required -> Show Password Prompt Modal (4-digit PIN)
-      if (data.type === 'auth-required') {
-        setShowAuthModal(true);
-        setShowCreateModal(false);
-        setAuthError(data.reason || 'กรุณากรอกรหัสผ่าน 4 หลัก');
-        return;
-      }
-
-      // 4. Auth Failed -> Update Error text in Modal
-      if (data.type === 'auth-failed') {
-        setAuthError(data.reason || 'รหัสผ่าน 4 หลักไม่ถูกต้อง');
-        return;
-      }
-
-      // 5. Room Joined -> Successfully authenticated & joined
-      if (data.type === 'room-joined') {
-        setShowCreateModal(false);
-        setShowAuthModal(false);
-        setRoomName(data.room);
-        setJoined(true);
-
-        // myAnimal is already set from localStorage before WS connected
-        // Just reset history state for this new session
-        localHistory.current = [];
-        localSeederMap.current = new Map();
-        seenMsgIds.current = new Set();
-
-        setMessages((prev) => [...prev, {
-          sender: 'system',
-          text: `คุณเข้าสู่ห้อง [${data.room}] ในฐานะ ${resolvedAnimal.icon} ${resolvedAnimal.name}`,
-          time: getCurrentTimeStr()
-        }]);
-        
-        if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-          chatWs.current.send(JSON.stringify({ type: 'request-init' }));
-        }
-        return;
-      }
-
-      // 6. Live Room Status Update from Server (Includes Animal Members List)
-      if (data.type === 'room-status') {
-        setHasOtherPeers(data.hasOtherPeers);
-        if (data.members) setRoomMembers(data.members);
-        return;
-      }
-
-      // 7. System initiation signal
-      if (data.type === 'system-init') {
-        if (data.hasOtherPeers) setHasOtherPeers(true);
-        if (data.isInitiator) initWebRTC(true);
-        return;
-      }
-
-      // 8. Peer joined event
-      if (data.type === 'peer-joined') {
-        setHasOtherPeers(true);
-        const peerIdentity = (data.animalName && data.animalName !== 'undefined')
-          ? `${data.animalIcon || '🐾'} ${data.animalName}`
-          : 'เพื่อนใหม่';
-        setMessages((prev) => [...prev, { sender: 'system', text: `มี ${peerIdentity} เข้ามาในห้อง`, time: getCurrentTimeStr() }]);
-        return;
-      }
-
-      // 9. Peer left event — mark their files as unavailable
-      if (data.type === 'peer-left') {
-        setPeerConnected(false);
-        setHasOtherPeers(false);
-        const peerIdentity = (data.animalName && data.animalName !== 'undefined')
-          ? `${data.animalIcon || '🐾'} ${data.animalName}`
-          : 'เพื่อน';
-        setMessages((prev) => [...prev, { sender: 'system', text: `${peerIdentity} ออกจากห้องแล้ว`, time: getCurrentTimeStr() }]);
-        if (peerRef.current) {
-          peerRef.current.destroy();
-          peerRef.current = null;
-        }
-        // Mark files from this peer as unavailable
-        const deadMagnets = data.deadMagnets || [];
-        if (deadMagnets.length > 0) {
-          setActiveTorrents((prev) => prev.map((t) =>
-            deadMagnets.includes(t.magnetURI) ? { ...t, unavailable: true } : t
-          ));
-        }
-        return;
-      }
-
-      // 10. Server asks THIS peer to relay history to a new joiner (Option B)
-      if (data.type === 'request-history') {
-        const targetPeerId = data.targetPeerId;
-        if (targetPeerId && chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-          chatWs.current.send(JSON.stringify({
-            type: 'room-history',
-            targetPeerId,
-            messages: localHistory.current
-          }));
-        }
-        return;
-      }
-
-      // 11. Receiving room history from an existing peer (Option B)
-      if (data.type === 'room-history') {
-        const historyMessages = data.messages || [];
-        historyMessages.forEach((msg) => {
-          if (msg.msgId && seenMsgIds.current.has(msg.msgId)) return;
-          if (msg.msgId) seenMsgIds.current.add(msg.msgId);
-
-          if (msg.type === 'chat') {
-            setMessages((prev) => [...prev, {
-              sender: 'peer',
-              text: msg.text,
-              time: msg.time || '',
-              animalName: msg.animalName || 'เพื่อน P2P',
-              animalIcon: msg.animalIcon || '🐾',
-              fromHistory: true
-            }]);
-          } else if (msg.type === 'torrent-meta') {
-            registerIncomingTorrentCard(msg);
-            // Rebuild seederMap from history
-            if (msg.senderPeerId && msg.magnetURI) {
-              if (!localSeederMap.current.has(msg.senderPeerId)) {
-                localSeederMap.current.set(msg.senderPeerId, new Set());
-              }
-              localSeederMap.current.get(msg.senderPeerId).add(msg.magnetURI);
-            }
-          }
-        });
-        return;
-      }
-
-      // 12. Chat or WebTorrent Metadata Signaling
-      if (data.type === 'chat' || data.type === 'torrent-meta') {
-        handleIncomingMessage(data);
-        return;
-      }
-
-      // 11. WebRTC Signaling (Offers, Answers, ICE Candidates)
-      handleWebRTCSignal(data);
+    // Auto-reconnect if server closes the connection (e.g. heartbeat timeout on mobile)
+    chatWs.current.onclose = (e) => {
+      // Only reconnect if still joined and closed unexpectedly (not by user action)
+      if (e.wasClean) return; // user called ws.close() → don't reconnect
+      if (!joinedRef.current) return; // user left the room → don't reconnect
+      console.warn('[WS]: Connection lost, reconnecting in 2s...');
+      setTimeout(() => {
+        if (joinedRef.current) requestJoinRoomReconnect(targetRoom, resolvedAnimal);
+      }, 2000);
     };
+
+    chatWs.current.onmessage = fullMessageHandler;
   };
 
   // Cancel Pending Modal & Return to Room Join Screen
