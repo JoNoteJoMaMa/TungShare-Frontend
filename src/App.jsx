@@ -769,8 +769,14 @@ export default function App() {
 
     // 10c. Peer requests direct P2P file data stream fallback
     if (data.type === 'request-direct-p2p-stream' && data.magnetURI) {
-      if (torrentClient.current) {
-        const torrent = torrentClient.current.get(data.magnetURI);
+      if (torrentClient.current && torrentClient.current.torrents) {
+        let torrent = torrentClient.current.get(data.magnetURI);
+        if (!torrent) {
+          torrent = torrentClient.current.torrents.find(
+            t => t.magnetURI === data.magnetURI || t.infoHash === data.magnetURI || (data.magnetURI && data.magnetURI.includes(t.infoHash))
+          );
+        }
+
         if (torrent && torrent.files && torrent.files[0]) {
           const file = torrent.files[0];
           const rawBlob = file._file;
@@ -822,7 +828,7 @@ export default function App() {
 
         setActiveTorrents((prev) =>
           prev.map((item) => {
-            if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI) {
+            if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI || (data.magnetURI && data.magnetURI.includes(item.infoHash)) || (item.magnetURI && item.magnetURI.includes(data.magnetURI))) {
               return {
                 ...item,
                 progress: 100,
