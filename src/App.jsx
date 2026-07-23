@@ -439,6 +439,13 @@ export default function App() {
     }
   }, [messages, showChatScrollDown]);
 
+  // Auto-scroll files (top to bottom like chat)
+  useEffect(() => {
+    if (!showFileScrollDown) {
+      fileBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [activeTorrents, showFileScrollDown]);
+
   // Scroll detection for Chat section
   const handleChatScroll = (e) => {
     const { scrollTop, scrollHeight, clientHeight } = e.target;
@@ -951,6 +958,7 @@ export default function App() {
           setStatusText(`ปล่อย ${fileList.length} ไฟล์สำเร็จ! Magnet URIs ถูกส่งเข้าห้องแล้ว`);
 
           const msgId = 'torrent_' + Math.random().toString(36).substr(2, 9);
+          const timestamp = getCurrentTimeStr();
           const meta = {
             type: 'torrent-meta',
             msgId,
@@ -959,7 +967,8 @@ export default function App() {
             fileSize: file.size,
             fileType: fileType,
             animalName: myAnimal.name,
-            animalIcon: myAnimal.icon
+            animalIcon: myAnimal.icon,
+            time: timestamp
           };
 
           seenMsgIds.current.add(msgId);
@@ -1039,12 +1048,13 @@ export default function App() {
       done: false,
       blobUrl: null,
       animalName: meta.animalName || 'เพื่อน P2P',
-      animalIcon: meta.animalIcon || '📦'
+      animalIcon: meta.animalIcon || '📦',
+      time: meta.time || getCurrentTimeStr()
     };
 
     setActiveTorrents((prev) => {
       if (prev.some(t => t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI)) return prev;
-      return [torrentItem, ...prev];
+      return [...prev, torrentItem];
     });
 
     setStatusText(`มีไฟล์ใหม่จาก ${meta.animalIcon || '📦'} ${meta.animalName || 'เพื่อน'} [${meta.fileName}]`);
@@ -1132,13 +1142,14 @@ export default function App() {
       done: isSeeder,
       blobUrl: meta.blobUrl || null,
       animalName: meta.animalName || myAnimal.name,
-      animalIcon: meta.animalIcon || myAnimal.icon
+      animalIcon: meta.animalIcon || myAnimal.icon,
+      time: meta.time || getCurrentTimeStr()
     };
 
     setActiveTorrents((prev) => {
       const exists = prev.find(t => t.infoHash === torrentItem.infoHash || t.magnetURI === torrentItem.magnetURI);
       if (exists) return prev.map(t => (t.infoHash === torrentItem.infoHash || t.magnetURI === torrentItem.magnetURI) ? { ...t, ...torrentItem } : t);
-      return [torrentItem, ...prev];
+      return [...prev, torrentItem];
     });
 
     attachTorrentListeners(torrent, meta, isSeeder);
@@ -1648,8 +1659,9 @@ export default function App() {
                         <div className="file-meta">{formatBytes(t.size)}</div>
                       </div>
 
-                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 8 }}>
-                        ผู้ส่ง: <strong>{t.animalIcon} {t.animalName}</strong>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span>ผู้ส่ง: <strong>{t.animalIcon} {t.animalName}</strong></span>
+                        {t.time && <span style={{ fontSize: '0.75rem', opacity: 0.75 }}>{t.time}</span>}
                       </div>
 
                       {/* Show Start Download Button if not started yet and not unavailable */}
