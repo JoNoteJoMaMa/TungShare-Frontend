@@ -4,13 +4,24 @@ import './App.css';
 
 const WebTorrent = WebTorrentModule.default || WebTorrentModule;
 
-const BASE_SERVER_URL = 'ws://localhost:8080';
-const TRACKER_URLS = [
-  'ws://localhost:8000',
-  'ws://localhost:8000/announce',
-  'wss://tracker.openwebtorrent.com',
-  'wss://tracker.btorrent.xyz'
-];
+// Environment variable support for cloud deployment (Vercel + Render)
+const BASE_SERVER_URL = import.meta.env.VITE_BACKEND_URL || (
+  window.location.protocol === 'https:'
+    ? `wss://${window.location.host}`
+    : 'ws://localhost:8080'
+);
+
+const getTrackerUrls = (baseUrl) => {
+  const wsUrl = baseUrl.replace(/^http/, 'ws');
+  return [
+    wsUrl,
+    `${wsUrl}/announce`,
+    'wss://tracker.openwebtorrent.com',
+    'wss://tracker.btorrent.xyz'
+  ];
+};
+
+const TRACKER_URLS = getTrackerUrls(BASE_SERVER_URL);
 
 // 100 Thai Animals with accurate Emojis
 const THAI_ANIMALS = [
@@ -87,7 +98,7 @@ const THAI_ANIMALS = [
   { name: 'ด้วงทอง', icon: '🪲' },
   { name: 'เต่าทอง', icon: '🐞' },
   { name: 'แมงมุม', icon: '🕷️' },
-  { name: 'แมงป่อง', icon: '🦂' },
+  { name: 'แมงป่อง', icon: '<ctrl42>' },
   { name: 'ยุง', icon: '🦟' },
   { name: 'แมลงวัน', icon: '🪰' },
   { name: 'ทากน้อย', icon: '🐌' },
