@@ -1184,6 +1184,7 @@ export default function App() {
       if (!torrent || typeof torrent.on !== 'function') return;
 
       if (writableStream) {
+        torrent._hasDirectDiskStream = true;
         torrent.on('ready', () => {
           const file = torrent.files && torrent.files[0];
           if (file && typeof file.createReadStream === 'function') {
@@ -1375,7 +1376,7 @@ export default function App() {
         prev.map((item) => (item.infoHash === magnetURI || item.magnetURI === magnetURI) ? { ...item, blobUrl: url, done: true, progress: 100 } : item)
       );
 
-      if (!isSeeder) {
+      if (!isSeeder && !torrent._hasDirectDiskStream) {
         triggerAutoSave(url, fileName, magnetURI);
       }
     };
