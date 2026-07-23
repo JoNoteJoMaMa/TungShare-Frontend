@@ -737,29 +737,72 @@ export default function App() {
     }
 
     // 10b. Peer requests immediate tracker re-announce for a magnet link
+    if (data.type === 'request-torrent-reannounce' && data.magnetURI) {
+      if (torrentClient.current) {
+        const torrent = torrentClient.current.get(data.magnetURI);
+        if (torrent) {
+          if (typeof torrent.announce === 'function') {
+            try { torrent.announce(); } catch (e) {}
+          }
+          if (typeof torrent.resume === 'function') {
+            try { torrent.resume(); } catch (e) {}
+          }
+          if (torrent.discovery) {
+            if (typeof torrent.discovery.announce === 'function') {
+              try { torrent.discovery.announce(); } catch (e) {}
+            }
+            if (torrent.discovery.tracker && typeof torrent.discovery.tracker.announce === 'function') {
+              try { torrent.discovery.tracker.announce(); } catch (e) {}
+            }
+            if (Array.isArray(torrent.discovery.trackers)) {
+              torrent.discovery.trackers.forEach(tr => {
+                if (tr && typeof tr.announce === 'function') {
+                  try { tr.announce(); } catch (e) {}
+                }
+              });
+            }
+          }
+        }
+      }
+      return;
+    }
+
     // 10c. Peer requests direct P2P file data stream fallback
     if (data.type === 'request-direct-p2p-stream' && data.magnetURI) {
       if (torrentClient.current) {
         const torrent = torrentClient.current.get(data.magnetURI);
         if (torrent && torrent.files && torrent.files[0]) {
           const file = torrent.files[0];
-          if (typeof file.getBuffer === 'function') {
-            file.getBuffer((err, buffer) => {
-              if (!err && buffer) {
-                const payload = JSON.stringify({
-                  type: 'direct-p2p-file-data',
-                  magnetURI: data.magnetURI,
-                  base64Data: buffer.toString('base64'),
-                  fileName: file.name
-                });
-                if (peerRef.current && peerRef.current.connected) {
-                  try { peerRef.current.send(payload); } catch (e) {}
-                }
-                if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-                  try { chatWs.current.send(payload); } catch (e) {}
-                }
+          const rawBlob = file._file;
+
+          const sendBufferPayload = (blobObj) => {
+            if (!blobObj) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+              const base64Data = reader.result ? reader.result.toString().split(',')[1] : '';
+              if (!base64Data) return;
+              const payload = JSON.stringify({
+                type: 'direct-p2p-file-data',
+                magnetURI: data.magnetURI,
+                base64Data,
+                fileName: file.name
+              });
+              if (peerRef.current && peerRef.current.connected) {
+                try { peerRef.current.send(payload); } catch (e) {}
               }
-            });
+              if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+                try { chatWs.current.send(payload); } catch (e) {}
+              }
+            };
+            reader.readAsDataURL(blobObj);
+          };
+
+          if (rawBlob) {
+            sendBufferPayload(rawBlob);
+          } else if (typeof file.getBlob === 'function') {
+            try {
+              file.getBlob((err, b) => { if (!err && b) sendBufferPayload(b); });
+            } catch (e) {}
           }
         }
       }
