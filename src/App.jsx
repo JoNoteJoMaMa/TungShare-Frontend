@@ -1147,7 +1147,40 @@ export default function App() {
     setStatusText(`มีไฟล์ใหม่จาก ${meta.animalIcon || '📦'} ${meta.animalName || 'เพื่อน'} [${meta.fileName}]`);
   };
 
-  // Direct-to-Disk P2P WebTorrent Download with pre-warmed connection pulse
+  // Get direct physical disk writable stream via FileSystem Access API (Desktop) or OPFS (Mobile / Safari / Chrome)
+  const getDiskWritableStream = async (fileName) => {
+    // 1. Desktop FileSystem Access API (showSaveFilePicker)
+    if (typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
+      try {
+        const fileHandle = await window.showSaveFilePicker({
+          suggestedName: fileName || 'download'
+        });
+        const stream = await fileHandle.createWritable();
+        return { stream, mode: 'picker', handle: fileHandle };
+      } catch (err) {
+        console.warn('showSaveFilePicker skipped/cancelled:', err);
+      }
+    }
+
+    // 2. Mobile & Fallback: OPFS (Origin Private File System on Hard Disk/Flash Storage)
+    if (typeof navigator !== 'undefined' && navigator.storage && typeof navigator.storage.getDirectory === 'function') {
+      try {
+        const root = await navigator.storage.getDirectory();
+        const safeName = (fileName || 'download').replace(/[/\\?%*:|"<>]/g, '_');
+        const fileHandle = await root.getFileHandle(safeName, { create: true });
+        if (typeof fileHandle.createWritable === 'function') {
+          const stream = await fileHandle.createWritable();
+          return { stream, mode: 'opfs', handle: fileHandle, fileName: safeName };
+        }
+      } catch (err) {
+        console.warn('OPFS createWritable failed:', err);
+      }
+    }
+
+    return null;
+  };
+
+  // Direct-to-Disk P2P WebTorrent Download (OPFS / FileSystem Access for 0 MB RAM)
   const startDownload = async (meta) => {
     if (!meta || !meta.magnetURI) return;
 
@@ -1155,47 +1188,42 @@ export default function App() {
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
     );
 
-    // Pulse request-init and request-torrent-reannounce over WebSocket to force seeder tracker re-announce
+    // Pulse request-init and request-torrent-reannounce over WebSocket
     if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
       chatWs.current.send(JSON.stringify({ type: 'request-init' }));
       chatWs.current.send(JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI }));
     }
 
-    let writableStream = null;
-
-    // Prompt user for save path immediately on click (0 RAM Direct-to-Disk)
-    if ('showSaveFilePicker' in window) {
-      try {
-        const fileHandle = await window.showSaveFilePicker({
-          suggestedName: meta.name || meta.fileName || 'download'
-        });
-        writableStream = await fileHandle.createWritable();
-        setStatusText(`เปิดสตรีมตรงลงดิสก์สำหรับไฟล์ [${meta.name || meta.fileName}] สำเร็จ!`);
-      } catch (err) {
-        console.warn('FileSystem Access skipped/cancelled, fallback to memory stream:', err);
-      }
-    }
+    const fileName = meta.name || meta.fileName || 'download';
+    let diskTarget = await getDiskWritableStream(fileName);
 
     if (!torrentClient.current) return;
 
-    setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อสตรีมไฟล์ [${meta.name || meta.fileName}]...`);
+    if (diskTarget && diskTarget.stream) {
+      const modeLabel = diskTarget.mode === 'picker' ? 'ดิสก์เครื่อง' : 'OPFS Flash Storage';
+      setStatusText(`เปิดสตรีมตรงลงดิสก์ (${modeLabel}) สำหรับ [${fileName}] สำเร็จ! (0 MB RAM)`);
+    } else {
+      setStatusText(`กำลังสตรีมไฟล์ P2P สำหรับ [${fileName}]...`);
+    }
 
     const setupTorrent = (torrent) => {
       if (!torrent || typeof torrent.on !== 'function') return;
 
-      if (writableStream) {
-        torrent._hasDirectDiskStream = true;
+      if (diskTarget && diskTarget.stream) {
+        torrent._hasDirectDiskStream = (diskTarget.mode === 'picker');
+        torrent._opfsDiskTarget = (diskTarget.mode === 'opfs' ? diskTarget : null);
+
         torrent.on('ready', () => {
           const file = torrent.files && torrent.files[0];
           if (file && typeof file.createReadStream === 'function') {
             const stream = file.createReadStream();
             stream.on('data', async (chunk) => {
-              try { await writableStream.write(chunk); } catch (e) {}
+              try { await diskTarget.stream.write(chunk); } catch (e) {}
             });
             stream.on('end', async () => {
               try {
-                await writableStream.close();
-                setStatusText(`เขียนไฟล์ [${meta.name || meta.fileName}] ลงดิสก์สมบูรณ์แล้ว!`);
+                await diskTarget.stream.close();
+                setStatusText(`เขียนไฟล์ [${fileName}] ลงดิสก์สมบูรณ์แล้ว! (0 MB RAM)`);
               } catch (e) {}
             });
           }
