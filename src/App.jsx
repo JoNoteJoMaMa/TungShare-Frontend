@@ -17,7 +17,7 @@ const getTrackerUrls = (baseUrl) => {
     wsUrl,
     `${wsUrl}/announce`,
     'wss://tracker.openwebtorrent.com',
-    'wss://tracker.btorrent.xyz'
+    'wss://tracker.webtorrent.dev'
   ];
 };
 
