@@ -244,6 +244,9 @@ class NativePeer {
     if (this.destroyed || !data) return;
     try {
       if (data.type === 'offer') {
+        if (this.pc.signalingState !== 'stable' && this.pc.signalingState !== 'have-local-offer') {
+          return;
+        }
         this.pc.setRemoteDescription(new RTCSessionDescription(data))
           .then(() => this.pc.createAnswer())
           .then((answer) => this.pc.setLocalDescription(answer))
@@ -252,6 +255,10 @@ class NativePeer {
           })
           .catch((err) => console.warn('Offer signal err:', err));
       } else if (data.type === 'answer') {
+        // Only set remote answer if we are waiting for an answer (have-local-offer)
+        if (this.pc.signalingState !== 'have-local-offer') {
+          return; // Ignore redundant answer when state is already stable
+        }
         this.pc.setRemoteDescription(new RTCSessionDescription(data))
           .catch((err) => console.warn('Answer signal err:', err));
       } else if (data.candidate || data.type === 'candidate') {
@@ -1126,49 +1133,20 @@ export default function App() {
     setStatusText(`มีไฟล์ใหม่จาก ${meta.animalIcon || '📦'} ${meta.animalName || 'เพื่อน'} [${meta.fileName}]`);
   };
 
-  // Direct-to-Disk P2P WebTorrent Download using Native FileSystem Access API
-  const startDownload = async (meta) => {
+  // Direct-to-Disk P2P WebTorrent Download
+  const startDownload = (meta) => {
+    const fileName = meta.name || meta.fileName || 'download';
+
     setActiveTorrents((prev) =>
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
     );
 
-    let writableStream = null;
-
-    if ('showSaveFilePicker' in window) {
-      try {
-        const fileHandle = await window.showSaveFilePicker({
-          suggestedName: meta.name
-        });
-        writableStream = await fileHandle.createWritable();
-        setStatusText(`กำลังเขียนไฟล์ P2P [${meta.name}] ตรงลงดิสก์เครื่อง...`);
-      } catch (err) {
-        console.warn('FileSystem Access skipped/cancelled, fallback to memory stream:', err);
-      }
-    }
-
     if (!torrentClient.current) return;
+
+    setStatusText(`กำลังดาวน์โหลดไฟล์ [${fileName}]...`);
 
     const setupTorrent = (torrent) => {
       if (!torrent || typeof torrent.on !== 'function') return;
-
-      if (writableStream) {
-        torrent.on('ready', () => {
-          const file = torrent.files && torrent.files[0];
-          if (file && typeof file.createReadStream === 'function') {
-            const stream = file.createReadStream();
-            stream.on('data', async (chunk) => {
-              try { await writableStream.write(chunk); } catch(e){}
-            });
-            stream.on('end', async () => {
-              try {
-                await writableStream.close();
-                setStatusText(`ดาวน์โหลดไฟล์ [${meta.name}] ตรงลงดิสก์สมบูรณ์แล้ว!`);
-              } catch(e){}
-            });
-          }
-        });
-      }
-
       attachTorrentListeners(torrent, meta, false);
     };
 
@@ -1177,7 +1155,13 @@ export default function App() {
       if (existingTorrent && typeof existingTorrent.on === 'function') {
         setupTorrent(existingTorrent);
       } else {
-        const addedTorrent = torrentClient.current.add(meta.magnetURI, { announce: TRACKER_URLS }, (torrent) => {
+        const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+        const addOptions = {
+          announce: TRACKER_URLS,
+          maxConns: isMobileDevice ? 2 : 55
+        };
+
+        const addedTorrent = torrentClient.current.add(meta.magnetURI, addOptions, (torrent) => {
           setupTorrent(torrent);
         });
 
