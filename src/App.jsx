@@ -1270,6 +1270,9 @@ export default function App() {
     }
 
     if (torrent && typeof torrent.on === 'function') {
+      if (typeof torrent.resume === 'function') {
+        try { torrent.resume(); } catch (e) {}
+      }
       attachTorrentListeners(torrent, meta, false);
       try {
         torrent.on('error', (err) => {
@@ -1279,31 +1282,29 @@ export default function App() {
       } catch (e) {}
     }
 
-    // 2. Pulse request-init and request-torrent-reannounce over WebSocket & WebRTC
+    // 2. Pulse request-init and request-torrent-reannounce over WebSocket & WebRTC repeatedly until connected
     const reannounceMsg = JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI });
-    if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-      chatWs.current.send(JSON.stringify({ type: 'request-init' }));
-      chatWs.current.send(reannounceMsg);
-      // Delayed 600ms & 1500ms pulses to ensure mobile ICE candidate gathering completes
-      setTimeout(() => {
-        if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-          try { chatWs.current.send(reannounceMsg); } catch (e) {}
-        }
-      }, 600);
-      setTimeout(() => {
-        if (torrent && (torrent.numPeers === 0 || torrent.progress === 0)) {
-          if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-            try {
-              chatWs.current.send(JSON.stringify({ type: 'request-init' }));
-              chatWs.current.send(reannounceMsg);
-            } catch (e) {}
-          }
-        }
-      }, 1500);
-    }
-    if (peerRef.current && peerRef.current.connected) {
-      try { peerRef.current.send(reannounceMsg); } catch (e) {}
-    }
+    const sendPulses = () => {
+      if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+        try {
+          chatWs.current.send(JSON.stringify({ type: 'request-init' }));
+          chatWs.current.send(reannounceMsg);
+        } catch (e) {}
+      }
+      if (peerRef.current && peerRef.current.connected) {
+        try { peerRef.current.send(reannounceMsg); } catch (e) {}
+      }
+    };
+
+    sendPulses();
+    const pulseInterval = setInterval(() => {
+      if (torrent && (torrent.done || torrent.progress === 1)) {
+        clearInterval(pulseInterval);
+      } else {
+        sendPulses();
+      }
+    }, 1500);
+    setTimeout(() => clearInterval(pulseInterval), 15000);
 
     setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อสตรีมไฟล์ [${fileName}]...`);
 
