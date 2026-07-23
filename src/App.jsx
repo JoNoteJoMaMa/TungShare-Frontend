@@ -715,8 +715,25 @@ export default function App() {
     if (data.type === 'request-torrent-reannounce' && data.magnetURI) {
       if (torrentClient.current) {
         const torrent = torrentClient.current.get(data.magnetURI);
-        if (torrent && torrent.discovery && torrent.discovery.tracker) {
-          try { torrent.discovery.tracker.announce(); } catch (e) {}
+        if (torrent) {
+          if (typeof torrent.announce === 'function') {
+            try { torrent.announce(); } catch (e) {}
+          }
+          if (torrent.discovery) {
+            if (typeof torrent.discovery.announce === 'function') {
+              try { torrent.discovery.announce(); } catch (e) {}
+            }
+            if (torrent.discovery.tracker && typeof torrent.discovery.tracker.announce === 'function') {
+              try { torrent.discovery.tracker.announce(); } catch (e) {}
+            }
+            if (Array.isArray(torrent.discovery.trackers)) {
+              torrent.discovery.trackers.forEach(tr => {
+                if (tr && typeof tr.announce === 'function') {
+                  try { tr.announce(); } catch (e) {}
+                }
+              });
+            }
+          }
         }
       }
       return;
@@ -1225,10 +1242,20 @@ export default function App() {
       });
     }
 
-    // 2. Pulse request-init and request-torrent-reannounce over WebSocket AFTER registering torrent
+    // 2. Pulse request-init and request-torrent-reannounce over WebSocket & WebRTC
+    const reannounceMsg = JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI });
     if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
       chatWs.current.send(JSON.stringify({ type: 'request-init' }));
-      chatWs.current.send(JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI }));
+      chatWs.current.send(reannounceMsg);
+      // Delayed 600ms pulse to ensure mobile ICE candidate gathering completes
+      setTimeout(() => {
+        if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+          try { chatWs.current.send(reannounceMsg); } catch (e) {}
+        }
+      }, 600);
+    }
+    if (peerRef.current && peerRef.current.connected) {
+      try { peerRef.current.send(reannounceMsg); } catch (e) {}
     }
 
     setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อสตรีมไฟล์ [${fileName}]...`);
