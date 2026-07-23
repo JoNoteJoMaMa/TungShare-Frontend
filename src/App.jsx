@@ -1130,20 +1130,54 @@ export default function App() {
     setStatusText(`มีไฟล์ใหม่จาก ${meta.animalIcon || '📦'} ${meta.animalName || 'เพื่อน'} [${meta.fileName}]`);
   };
 
-  // Instant P2P WebTorrent Download (Starts immediately in memory/WebRTC, no blocking path picker)
-  const startDownload = (meta) => {
+  // Direct-to-Disk P2P WebTorrent Download (Option A: 0 RAM Direct-to-Disk Streaming)
+  const startDownload = async (meta) => {
     if (!meta || !meta.magnetURI) return;
 
     setActiveTorrents((prev) =>
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
     );
 
+    let writableStream = null;
+
+    // Prompt user for save path immediately on click (0 RAM Direct-to-Disk)
+    if ('showSaveFilePicker' in window) {
+      try {
+        const fileHandle = await window.showSaveFilePicker({
+          suggestedName: meta.name || meta.fileName || 'download'
+        });
+        writableStream = await fileHandle.createWritable();
+        setStatusText(`เปิดสตรีมตรงลงดิสก์สำหรับไฟล์ [${meta.name || meta.fileName}] สำเร็จ!`);
+      } catch (err) {
+        console.warn('FileSystem Access skipped/cancelled, fallback to memory stream:', err);
+      }
+    }
+
     if (!torrentClient.current) return;
 
-    setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อดาวน์โหลด [${meta.name || meta.fileName}]...`);
+    setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อสตรีมไฟล์ [${meta.name || meta.fileName}]...`);
 
     const setupTorrent = (torrent) => {
       if (!torrent || typeof torrent.on !== 'function') return;
+
+      if (writableStream) {
+        torrent.on('ready', () => {
+          const file = torrent.files && torrent.files[0];
+          if (file && typeof file.createReadStream === 'function') {
+            const stream = file.createReadStream();
+            stream.on('data', async (chunk) => {
+              try { await writableStream.write(chunk); } catch (e) {}
+            });
+            stream.on('end', async () => {
+              try {
+                await writableStream.close();
+                setStatusText(`เขียนไฟล์ [${meta.name || meta.fileName}] ลงดิสก์สมบูรณ์แล้ว!`);
+              } catch (e) {}
+            });
+          }
+        });
+      }
+
       attachTorrentListeners(torrent, meta, false);
     };
 
