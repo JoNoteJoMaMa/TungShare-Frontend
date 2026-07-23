@@ -4,17 +4,28 @@ import './App.css';
 
 const WebTorrent = WebTorrentModule.default || WebTorrentModule;
 
-// Environment variable support for cloud deployment (Vercel + Render)
-const BASE_SERVER_URL = (import.meta.env.VITE_BACKEND_URL || 'wss://tungshare-backend.onrender.com').replace(/\/+$/, '');
+const getBaseServerUrl = () => {
+  if (import.meta.env.VITE_BACKEND_URL) {
+    return import.meta.env.VITE_BACKEND_URL;
+  }
+  if (typeof window !== 'undefined') {
+    const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    if (isLocal) {
+      return `ws://${window.location.hostname}:8080`;
+    }
+  }
+  return 'wss://tungshare-backend.onrender.com';
+};
+
+const BASE_SERVER_URL = getBaseServerUrl().replace(/\/+$/, '');
 
 const getTrackerUrls = (baseUrl) => {
   const wsUrl = baseUrl.replace(/^http/, 'ws');
-  // Use canonical /announce path so all seeders & downloaders connect to the exact same tracker URL
   const backendTrackerUrl = `${wsUrl}/announce`;
   return [
-    backendTrackerUrl,
+    'wss://tracker.webtorrent.dev',
     'wss://tracker.openwebtorrent.com',
-    'wss://tracker.webtorrent.dev'
+    backendTrackerUrl
   ];
 };
 
@@ -1241,21 +1252,33 @@ export default function App() {
     );
 
     // 1. Register torrent synchronously in WebTorrent client FIRST so it is immediately listening
-    let torrent = torrentClient.current.get(meta.magnetURI);
+    let torrent = null;
+    try {
+      torrent = torrentClient.current.get(meta.magnetURI);
+    } catch (e) {}
+
     if (!torrent) {
       try {
         torrent = torrentClient.current.add(meta.magnetURI, { announce: TRACKER_URLS });
       } catch (e) {
-        console.warn('WebTorrent add error handled:', e);
+        console.warn('WebTorrent add fallback triggered:', e);
+        // Find existing torrent in torrentClient array if duplicate error occurred
+        if (torrentClient.current.torrents && torrentClient.current.torrents.length > 0) {
+          torrent = torrentClient.current.torrents.find(
+            t => t.magnetURI === meta.magnetURI || t.infoHash === meta.magnetURI || (meta.magnetURI && meta.magnetURI.includes(t.infoHash))
+          );
+        }
       }
     }
 
     if (torrent && typeof torrent.on === 'function') {
       attachTorrentListeners(torrent, meta, false);
-      torrent.on('error', (err) => {
-        console.error('Torrent download error:', err);
-        setStatusText(`[Download Error]: ${err.message}`);
-      });
+      try {
+        torrent.on('error', (err) => {
+          console.error('Torrent download error:', err);
+          setStatusText(`[Download Error]: ${err.message}`);
+        });
+      } catch (e) {}
     }
 
     // 2. Pulse request-init and request-torrent-reannounce over WebSocket & WebRTC
