@@ -311,15 +311,23 @@ export default function App() {
   const seenMsgIds = useRef(new Set());
   const autoDownloadedBlobs = useRef(new Set());
 
-  // Persistent Identity Token — stored in localStorage, same animal on rejoin
-  const MY_USER_ID = useRef((() => {
-    let uid = localStorage.getItem('tungshare_uid');
-    if (!uid) {
-      uid = 'uid_' + Math.random().toString(36).substr(2, 12) + '_' + Date.now().toString(36);
-      localStorage.setItem('tungshare_uid', uid);
+  // Persistent Identity Token — entirely client-side via localStorage
+  // Each room gets its own saved animal so the user appears the same on rejoin
+  const loadOrCreateIdentity = (roomName) => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('tungshare_identities') || '{}');
+      if (stored[roomName]) {
+        return stored[roomName]; // Return saved { name, icon } for this room
+      }
+      // Generate new identity and save it for this room
+      const newIdentity = generateThaiAnimalProfile();
+      stored[roomName] = newIdentity;
+      localStorage.setItem('tungshare_identities', JSON.stringify(stored));
+      return newIdentity;
+    } catch (e) {
+      return generateThaiAnimalProfile(); // Fallback if localStorage unavailable
     }
-    return uid;
-  })());
+  };
 
   // Local history for P2P relay to new joiners (Option B)
   const localHistory = useRef([]); // Array of { type, ...msgData }
@@ -457,16 +465,17 @@ export default function App() {
     setAuthError('');
     setPinInput('');
 
-    // Generate a fresh animal identity as proposal (server may override with saved identity)
-    const proposedAnimal = generateThaiAnimalProfile();
-    // Don't set myAnimal yet — wait for server to confirm (may return saved identity)
+    // Look up saved animal identity for this room in localStorage (pure client-side)
+    // This is the same animal the user had last time they were in this specific room
+    const resolvedAnimal = loadOrCreateIdentity(targetRoom);
+    setMyAnimal(resolvedAnimal); // Set immediately — no need to wait for server
 
     if (chatWs.current) {
       chatWs.current.close();
     }
 
-    // Include userId for persistent identity resolution on server
-    const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&userId=${encodeURIComponent(MY_USER_ID.current)}&animalName=${encodeURIComponent(proposedAnimal.name)}&animalIcon=${encodeURIComponent(proposedAnimal.icon)}`;
+    // Send resolved animal directly — server just relays it, no server-side identity lookup
+    const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&animalName=${encodeURIComponent(resolvedAnimal.name)}&animalIcon=${encodeURIComponent(resolvedAnimal.icon)}`;
     chatWs.current = new WebSocket(wsUrl);
 
     chatWs.current.onmessage = (event) => {
@@ -502,32 +511,24 @@ export default function App() {
       }
 
       // 5. Room Joined -> Successfully authenticated & joined
-      // Server returns confirmed animal (may be saved identity from prior visit)
       if (data.type === 'room-joined') {
         setShowCreateModal(false);
         setShowAuthModal(false);
         setRoomName(data.room);
         setJoined(true);
 
-        // Use server-confirmed animal identity (persistent if returning user)
-        const confirmedAnimal = {
-          name: data.animalName || proposedAnimal.name,
-          icon: data.animalIcon || proposedAnimal.icon
-        };
-        setMyAnimal(confirmedAnimal);
-
-        // Reset history and seederMap for new room session
+        // myAnimal is already set from localStorage before WS connected
+        // Just reset history state for this new session
         localHistory.current = [];
         localSeederMap.current = new Map();
         seenMsgIds.current = new Set();
 
         setMessages((prev) => [...prev, {
           sender: 'system',
-          text: `คุณเข้าสู่ห้อง [${data.room}] ในฐานะ ${confirmedAnimal.icon} ${confirmedAnimal.name}`,
+          text: `คุณเข้าสู่ห้อง [${data.room}] ในฐานะ ${resolvedAnimal.icon} ${resolvedAnimal.name}`,
           time: getCurrentTimeStr()
         }]);
         
-        // Request init state & WebRTC setup
         if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
           chatWs.current.send(JSON.stringify({ type: 'request-init' }));
         }
