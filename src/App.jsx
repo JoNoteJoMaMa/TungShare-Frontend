@@ -652,21 +652,19 @@ export default function App() {
       return;
     }
 
-    // 7. System initiation signal — eagerly pre-warm WebRTC on both sides
+    // 7. System initiation signal — joining peer acts as Answerer
     if (data.type === 'system-init') {
       if (data.hasOtherPeers) setHasOtherPeers(true);
-      if (data.isInitiator) {
-        initWebRTC(true);
-      } else if (data.hasOtherPeers) {
-        initWebRTC(false); // Pre-warm WebRTC DataChannel immediately for non-initiator
+      if (data.hasOtherPeers) {
+        initWebRTC(false); // Non-initiator (Answerer)
       }
       return;
     }
 
-    // 8. Peer joined event — pre-warm P2P route immediately
+    // 8. Peer joined event — existing peer acts as Initiator (creates Offer)
     if (data.type === 'peer-joined') {
       setHasOtherPeers(true);
-      initWebRTC(true); // Eagerly initiate WebRTC candidate gathering on peer join
+      initWebRTC(true); // Initiator (Offer creator)
       const peerIdentity = (data.animalName && data.animalName !== 'undefined')
         ? `${data.animalIcon || '🐾'} ${data.animalName}`
         : 'เพื่อนใหม่';
