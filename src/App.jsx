@@ -360,6 +360,7 @@ export default function App() {
 
   const seenMsgIds = useRef(new Set());
   const autoDownloadedBlobs = useRef(new Set());
+  const directTransferBuffers = useRef(new Map());
 
   // Persistent Identity Token — entirely client-side via localStorage
   // Each room gets its own saved animal so the user appears the same on rejoin
@@ -767,7 +768,7 @@ export default function App() {
       return;
     }
 
-    // 10c. Peer requests direct P2P file data stream fallback
+    // 10c. Peer requests direct P2P file data stream fallback (32 KB Chunked Stream)
     if (data.type === 'request-direct-p2p-stream' && data.magnetURI) {
       if (torrentClient.current && torrentClient.current.torrents) {
         let torrent = torrentClient.current.get(data.magnetURI);
@@ -781,33 +782,45 @@ export default function App() {
           const file = torrent.files[0];
           const rawBlob = file._file;
 
-          const sendBufferPayload = (blobObj) => {
+          const sendChunkedBufferPayload = (blobObj) => {
             if (!blobObj) return;
             const reader = new FileReader();
             reader.onload = () => {
-              const base64Data = reader.result ? reader.result.toString().split(',')[1] : '';
-              if (!base64Data) return;
-              const payload = JSON.stringify({
-                type: 'direct-p2p-file-data',
-                magnetURI: data.magnetURI,
-                base64Data,
-                fileName: file.name
-              });
-              if (peerRef.current && peerRef.current.connected) {
-                try { peerRef.current.send(payload); } catch (e) {}
-              }
-              if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-                try { chatWs.current.send(payload); } catch (e) {}
+              const fullBase64 = reader.result ? reader.result.toString().split(',')[1] : '';
+              if (!fullBase64) return;
+
+              const CHUNK_SIZE = 32 * 1024; // 32 KB WebRTC DataChannel frame limit
+              const totalChunks = Math.ceil(fullBase64.length / CHUNK_SIZE);
+              const transferId = 'tr_' + Math.random().toString(36).substr(2, 9);
+
+              for (let i = 0; i < totalChunks; i++) {
+                const chunkStr = fullBase64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                const payload = JSON.stringify({
+                  type: 'direct-p2p-file-chunk',
+                  transferId,
+                  magnetURI: data.magnetURI,
+                  fileName: file.name,
+                  chunkIndex: i,
+                  totalChunks,
+                  chunkStr
+                });
+
+                if (peerRef.current && peerRef.current.connected) {
+                  try { peerRef.current.send(payload); } catch (e) {}
+                }
+                if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+                  try { chatWs.current.send(payload); } catch (e) {}
+                }
               }
             };
             reader.readAsDataURL(blobObj);
           };
 
           if (rawBlob) {
-            sendBufferPayload(rawBlob);
+            sendChunkedBufferPayload(rawBlob);
           } else if (typeof file.getBlob === 'function') {
             try {
-              file.getBlob((err, b) => { if (!err && b) sendBufferPayload(b); });
+              file.getBlob((err, b) => { if (!err && b) sendChunkedBufferPayload(b); });
             } catch (e) {}
           }
         }
@@ -815,35 +828,72 @@ export default function App() {
       return;
     }
 
-    // 10d. Receiving direct P2P file data stream fallback
-    if (data.type === 'direct-p2p-file-data' && data.magnetURI && data.base64Data) {
+    // 10d. Receiving direct P2P file chunk stream fallback
+    if (data.type === 'direct-p2p-file-chunk' && data.transferId) {
       try {
-        const binaryStr = atob(data.base64Data);
-        const bytes = new Uint8Array(binaryStr.length);
-        for (let i = 0; i < binaryStr.length; i++) {
-          bytes[i] = binaryStr.charCodeAt(i);
+        if (!directTransferBuffers.current.has(data.transferId)) {
+          directTransferBuffers.current.set(data.transferId, {
+            totalChunks: data.totalChunks,
+            chunks: new Map(),
+            magnetURI: data.magnetURI,
+            fileName: data.fileName
+          });
         }
-        const blob = new Blob([bytes]);
-        const blobUrl = trackBlobUrl(URL.createObjectURL(blob));
+
+        const transfer = directTransferBuffers.current.get(data.transferId);
+        transfer.chunks.set(data.chunkIndex, data.chunkStr);
+
+        const receivedCount = transfer.chunks.size;
+        const progressPct = Math.min(99, Math.round((receivedCount / transfer.totalChunks) * 100));
 
         setActiveTorrents((prev) =>
           prev.map((item) => {
             if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI || (data.magnetURI && data.magnetURI.includes(item.infoHash)) || (item.magnetURI && item.magnetURI.includes(data.magnetURI))) {
               return {
                 ...item,
-                progress: 100,
-                speed: '12.50',
-                done: true,
-                blobUrl: blobUrl
+                progress: progressPct,
+                speed: '15.00'
               };
             }
             return item;
           })
         );
 
-        setStatusText(`ดาวน์โหลดไฟล์ [${data.fileName || 'file'}] สมบูรณ์ 100%! ⚡ (P2P Direct)`);
+        // Reassemble full file when all 32 KB chunks arrive
+        if (transfer.chunks.size === transfer.totalChunks) {
+          let fullBase64 = '';
+          for (let i = 0; i < transfer.totalChunks; i++) {
+            fullBase64 += transfer.chunks.get(i);
+          }
+
+          const binaryStr = atob(fullBase64);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let i = 0; i < binaryStr.length; i++) {
+            bytes[i] = binaryStr.charCodeAt(i);
+          }
+          const blob = new Blob([bytes]);
+          const blobUrl = trackBlobUrl(URL.createObjectURL(blob));
+
+          setActiveTorrents((prev) =>
+            prev.map((item) => {
+              if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI || (data.magnetURI && data.magnetURI.includes(item.infoHash)) || (item.magnetURI && item.magnetURI.includes(data.magnetURI))) {
+                return {
+                  ...item,
+                  progress: 100,
+                  speed: '15.00',
+                  done: true,
+                  blobUrl: blobUrl
+                };
+              }
+              return item;
+            })
+          );
+
+          setStatusText(`ดาวน์โหลดไฟล์ [${data.fileName || 'file'}] สมบูรณ์ 100%! ⚡ (P2P Direct)`);
+          directTransferBuffers.current.delete(data.transferId);
+        }
       } catch (e) {
-        console.warn('direct-p2p-file-data handling error:', e);
+        console.warn('direct-p2p-file-chunk handling error:', e);
       }
       return;
     }
