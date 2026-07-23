@@ -98,7 +98,7 @@ const THAI_ANIMALS = [
   { name: 'ด้วงทอง', icon: '🪲' },
   { name: 'เต่าทอง', icon: '🐞' },
   { name: 'แมงมุม', icon: '🕷️' },
-  { name: 'แมงป่อง', icon: '<ctrl42>' },
+  { name: 'แมงป่อง', icon: '🦂' },
   { name: 'ยุง', icon: '🦟' },
   { name: 'แมลงวัน', icon: '🪰' },
   { name: 'ทากน้อย', icon: '🐌' },
@@ -1164,21 +1164,27 @@ export default function App() {
     if (!torrent || !torrent.files || torrent.files.length === 0) return;
     const file = torrent.files[0];
 
-    // 1. Try file.getBlobURL()
+    // Try extraction methods sequentially — NEVER run multiple parallel extractions
     if (typeof file.getBlobURL === 'function') {
       try {
         const res = file.getBlobURL((err, url) => {
-          if (!err && url) callback(url);
+          if (!err && url) return callback(url);
+          // Fallback to getBlob if getBlobURL fails
+          if (typeof file.getBlob === 'function') {
+            file.getBlob((err2, blob) => {
+              if (!err2 && blob) callback(URL.createObjectURL(blob));
+            });
+          }
         });
         if (res && typeof res.then === 'function') {
           res.then((url) => url && callback(url)).catch(() => {});
+          return;
         } else if (typeof res === 'string') {
-          callback(res);
+          return callback(res);
         }
       } catch (e) {}
     }
 
-    // 2. Try file.getBlob()
     if (typeof file.getBlob === 'function') {
       try {
         const res = file.getBlob((err, blob) => {
@@ -1186,26 +1192,15 @@ export default function App() {
         });
         if (res && typeof res.then === 'function') {
           res.then((blob) => blob && callback(URL.createObjectURL(blob))).catch(() => {});
+          return;
         }
       } catch (e) {}
     }
 
-    // 3. Try file.blob()
     if (typeof file.blob === 'function') {
       try {
         file.blob().then((blob) => blob && callback(URL.createObjectURL(blob))).catch(() => {});
-      } catch (e) {}
-    }
-
-    // 4. Try file.arrayBuffer() fallback
-    if (typeof file.arrayBuffer === 'function') {
-      try {
-        file.arrayBuffer().then((buf) => {
-          if (buf) {
-            const blob = new Blob([buf]);
-            callback(URL.createObjectURL(blob));
-          }
-        }).catch(() => {});
+        return;
       } catch (e) {}
     }
   };
@@ -1214,6 +1209,8 @@ export default function App() {
     if (!torrent || typeof torrent.on !== 'function') {
       return;
     }
+
+    let hasExtractedBlob = false;
 
     const applyBlobUrl = (url) => {
       if (!url) return;
@@ -1245,7 +1242,9 @@ export default function App() {
         })
       );
 
-      if (isDone) {
+      // ONLY extract Blob URL once when a downloader finishes — NEVER for seeders on upload ticks
+      if (!isSeeder && isDone && !hasExtractedBlob) {
+        hasExtractedBlob = true;
         extractBlobUrlFromTorrent(torrent, applyBlobUrl);
       }
     };
@@ -1258,11 +1257,16 @@ export default function App() {
     try {
       torrent.on('done', () => {
         setStatusText(`ดาวน์โหลดไฟล์ [${meta.fileName || meta.name}] สมบูรณ์แล้ว!`);
-        extractBlobUrlFromTorrent(torrent, applyBlobUrl);
+        if (!isSeeder && !hasExtractedBlob) {
+          hasExtractedBlob = true;
+          extractBlobUrlFromTorrent(torrent, applyBlobUrl);
+        }
       });
     } catch (e) {}
 
-    if (isSeeder || torrent.progress === 1 || torrent.done) {
+    // For non-seeders that are already done, extract once
+    if (!isSeeder && (torrent.progress === 1 || torrent.done) && !hasExtractedBlob) {
+      hasExtractedBlob = true;
       extractBlobUrlFromTorrent(torrent, applyBlobUrl);
     }
   };
