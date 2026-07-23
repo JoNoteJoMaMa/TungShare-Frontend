@@ -612,16 +612,21 @@ export default function App() {
       return;
     }
 
-    // 7. System initiation signal
+    // 7. System initiation signal — eagerly pre-warm WebRTC on both sides
     if (data.type === 'system-init') {
       if (data.hasOtherPeers) setHasOtherPeers(true);
-      if (data.isInitiator) initWebRTC(true);
+      if (data.isInitiator) {
+        initWebRTC(true);
+      } else if (data.hasOtherPeers) {
+        initWebRTC(false); // Pre-warm WebRTC DataChannel immediately for non-initiator
+      }
       return;
     }
 
-    // 8. Peer joined event
+    // 8. Peer joined event — pre-warm P2P route immediately
     if (data.type === 'peer-joined') {
       setHasOtherPeers(true);
+      initWebRTC(true); // Eagerly initiate WebRTC candidate gathering on peer join
       const peerIdentity = (data.animalName && data.animalName !== 'undefined')
         ? `${data.animalIcon || '🐾'} ${data.animalName}`
         : 'เพื่อนใหม่';
@@ -1130,13 +1135,18 @@ export default function App() {
     setStatusText(`มีไฟล์ใหม่จาก ${meta.animalIcon || '📦'} ${meta.animalName || 'เพื่อน'} [${meta.fileName}]`);
   };
 
-  // Direct-to-Disk P2P WebTorrent Download (Option A: 0 RAM Direct-to-Disk Streaming)
+  // Direct-to-Disk P2P WebTorrent Download with pre-warmed connection pulse
   const startDownload = async (meta) => {
     if (!meta || !meta.magnetURI) return;
 
     setActiveTorrents((prev) =>
       prev.map((t) => (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) ? { ...t, started: true } : t)
     );
+
+    // Pulse request-init to wake up WebSockets and warm up peer connections instantly
+    if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+      chatWs.current.send(JSON.stringify({ type: 'request-init' }));
+    }
 
     let writableStream = null;
 
@@ -1230,14 +1240,59 @@ export default function App() {
     attachTorrentListeners(torrent, meta, isSeeder);
   };
 
-  const saveFileToDisk = (url, fileName) => {
+  // Universal File Saving: Forced application/octet-stream override + iOS Native Share Sheet
+  const saveFileToDisk = async (url, fileName) => {
     if (!url) return;
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName || 'download';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const name = fileName || 'download';
+
+    try {
+      // 1. Fetch memory Blob from URL
+      const response = await fetch(url);
+      const blob = await response.blob();
+
+      // 2. Mobile Native Share Sheet (iOS Safari Photos/Files app or Android Share)
+      const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+      if (isMobileDevice && navigator && typeof navigator.canShare === 'function') {
+        try {
+          const fileObj = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+          if (navigator.canShare({ files: [fileObj] })) {
+            await navigator.share({
+              files: [fileObj],
+              title: name
+            });
+            return;
+          }
+        } catch (shareErr) {
+          // If share sheet is cancelled or unsupported for that file type -> fallback to forced blob download
+        }
+      }
+
+      // 3. Forced binary MIME type override ('application/octet-stream')
+      // Prevents iOS Safari & Mobile Chrome from opening images, PDFs, and videos in a new browser tab!
+      const forcedBlob = new Blob([blob], { type: 'application/octet-stream' });
+      const downloadUrl = trackBlobUrl(URL.createObjectURL(forcedBlob));
+
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = name;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        try { document.body.removeChild(a); } catch (e) {}
+      }, 1000);
+    } catch (e) {
+      // Direct anchor click fallback
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        try { document.body.removeChild(a); } catch (e) {}
+      }, 1000);
+    }
   };
 
   const triggerAutoSave = (url, fileName, magnetURI) => {
