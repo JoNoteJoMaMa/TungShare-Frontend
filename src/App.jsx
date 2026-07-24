@@ -346,6 +346,7 @@ export default function App() {
   // Pure WebTorrent P2P File Sharing State
   const [activeTorrents, setActiveTorrents] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [isJoining, setIsJoining] = useState(false);
 
   const chatWs = useRef(null);
   const peerRef = useRef(null);
@@ -594,6 +595,7 @@ export default function App() {
 
     // 1. Room Full Error (Limit 100 users per room)
     if (data.type === 'room-full') {
+      setIsJoining(false);
       alert(data.reason || 'ห้องนี้มีสมาชิกครบโควต้า 100 คนแล้ว ไม่สามารถเข้าร่วมได้');
       cancelPendingModal();
       return;
@@ -601,6 +603,7 @@ export default function App() {
 
     // 2. Room Not Found -> Show Create Room Modal (Optionally set 4-digit PIN)
     if (data.type === 'room-not-found') {
+      setIsJoining(false);
       setShowCreateModal(true);
       setShowAuthModal(false);
       return;
@@ -608,6 +611,7 @@ export default function App() {
 
     // 3. Auth Required -> Show Password Prompt Modal (4-digit PIN)
     if (data.type === 'auth-required') {
+      setIsJoining(false);
       setShowAuthModal(true);
       setShowCreateModal(false);
       setAuthError(data.reason || 'กรุณากรอกรหัสผ่าน 4 หลัก');
@@ -622,6 +626,7 @@ export default function App() {
 
     // 5. Room Joined -> Successfully authenticated & joined
     if (data.type === 'room-joined') {
+      setIsJoining(false);
       setShowCreateModal(false);
       setShowAuthModal(false);
       setRoomName(data.room);
@@ -913,6 +918,7 @@ export default function App() {
   const requestJoinRoom = () => {
     const targetRoom = roomInput.trim();
     if (!targetRoom) return alert('กรุณากรอกชื่อห้องก่อนครับ!');
+    setIsJoining(true);
     setPendingRoom(targetRoom);
     setAuthError('');
     setPinInput('');
@@ -932,6 +938,7 @@ export default function App() {
 
     // Auto-reconnect if server closes the connection (e.g. heartbeat timeout on mobile)
     chatWs.current.onclose = (e) => {
+      setIsJoining(false); // Always clear loading spinner on close
       // Only reconnect if still joined and closed unexpectedly (not by user action)
       if (e.wasClean) return; // user called ws.close() → don't reconnect
       if (!joinedRef.current) return; // user left the room → don't reconnect
@@ -939,6 +946,10 @@ export default function App() {
       setTimeout(() => {
         if (joinedRef.current) requestJoinRoomReconnect(targetRoom, resolvedAnimal);
       }, 2000);
+    };
+
+    chatWs.current.onerror = () => {
+      setIsJoining(false);
     };
 
     chatWs.current.onmessage = fullMessageHandler;
@@ -1196,8 +1207,16 @@ export default function App() {
       acquireWakeLock();
 
       try {
-        // uploadThrottle limits upload bandwidth to reduce memory pressure on mobile
-        // (512 KB/s per seeder is plenty for P2P; prevents RAM spike causing tab kill)
+        // Check and remove any duplicate torrent instance from client to prevent Duplicate torrent errors on re-upload
+        if (torrentClient.current && torrentClient.current.torrents && torrentClient.current.torrents.length > 0) {
+          const existing = torrentClient.current.torrents.find(
+            t => t.name === file.name || (t.files && t.files[0] && t.files[0].name === file.name)
+          );
+          if (existing && existing.infoHash) {
+            try { torrentClient.current.remove(existing.infoHash); } catch (e) {}
+          }
+        }
+
         const seedOptions = {
           announce: TRACKER_URLS,
           maxConns: 55,
@@ -1224,6 +1243,8 @@ export default function App() {
           seenMsgIds.current.add(msgId);
           localSeederFileMap.current.set(torrent.magnetURI, file);
           if (torrent.infoHash) localSeederFileMap.current.set(torrent.infoHash, file);
+          localHistory.current.push({ ...meta, type: 'torrent-meta' });
+          if (localHistory.current.length > MAX_LOCAL_HISTORY) localHistory.current.shift();
           addTorrentToState(torrent, { ...meta, blobUrl: uploaderBlobUrl }, true);
 
           // Broadcast WebTorrent Magnet URI to peers over WebSocket and WebRTC
@@ -1305,7 +1326,20 @@ export default function App() {
     };
 
     setActiveTorrents((prev) => {
-      if (prev.some(t => t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI)) return prev;
+      const exists = prev.find(t => t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI);
+      if (exists) {
+        return prev.map(t => {
+          if (t.infoHash === meta.magnetURI || t.magnetURI === meta.magnetURI) {
+            return {
+              ...t,
+              unavailable: false,
+              animalName: meta.animalName || t.animalName,
+              animalIcon: meta.animalIcon || t.animalIcon
+            };
+          }
+          return t;
+        });
+      }
       return [...prev, torrentItem];
     });
 
@@ -1902,8 +1936,20 @@ export default function App() {
               placeholder="กรอกชื่อห้อง (เช่น room123)"
               onKeyDown={(e) => e.key === 'Enter' && requestJoinRoom()}
             />
-            <button className="primary-btn" onClick={requestJoinRoom}>
-              เข้าร่วมห้อง
+            <button
+              className="primary-btn"
+              onClick={requestJoinRoom}
+              disabled={isJoining}
+              style={{ minWidth: 130, position: 'relative', opacity: isJoining ? 0.85 : 1 }}
+            >
+              {isJoining ? (
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center' }}>
+                  <span className="join-spinner" />
+                  กำลังเชื่อมต่อ...
+                </span>
+              ) : (
+                'เข้าร่วมห้อง'
+              )}
             </button>
           </div>
         </div>
