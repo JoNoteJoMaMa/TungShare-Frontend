@@ -1455,36 +1455,9 @@ export default function App() {
     setTimeout(() => clearInterval(pulseInterval), 15000);
 
     setStatusText(`กำลังเชื่อมต่อโหนด P2P เพื่อสตรีมไฟล์ [${fileName}]...`);
-
-    // 3. Asynchronously acquire physical disk writable stream (OPFS or picker) without delaying P2P handshake
-    getDiskWritableStream(fileName).then((diskTarget) => {
-      if (diskTarget && diskTarget.stream && torrent && typeof torrent.on === 'function') {
-        torrent._hasDirectDiskStream = (diskTarget.mode === 'picker');
-        torrent._opfsDiskTarget = (diskTarget.mode === 'opfs' ? diskTarget : null);
-
-        const attachStream = () => {
-          const file = torrent.files && torrent.files[0];
-          if (file && typeof file.createReadStream === 'function') {
-            const stream = file.createReadStream();
-            stream.on('data', async (chunk) => {
-              try { await diskTarget.stream.write(chunk); } catch (e) {}
-            });
-            stream.on('end', async () => {
-              try {
-                await diskTarget.stream.close();
-                setStatusText(`เขียนไฟล์ [${fileName}] ลงดิสก์สมบูรณ์แล้ว! (0 MB RAM)`);
-              } catch (e) {}
-            });
-          }
-        };
-
-        if (torrent.files && torrent.files.length > 0) {
-          attachStream();
-        } else {
-          torrent.on('ready', attachStream);
-        }
-      }
-    });
+    // Note: File is saved via triggerAutoSave → saveFileToDisk after confirmed download completion.
+    // We do NOT call getDiskWritableStream here because it would open a Save As dialog
+    // before any data arrives, creating a corrupt/empty file on disk alongside the real download.
   };
 
   const addTorrentToState = (torrent, meta, isSeeder) => {
@@ -2081,7 +2054,10 @@ export default function App() {
                   <input
                     type="file"
                     multiple
-                    onChange={(e) => handleFileSelect(e.target.files)}
+                    onChange={(e) => {
+                      handleFileSelect(e.target.files);
+                      e.target.value = ''; // Reset input so the same file can be selected again
+                    }}
                   />
                   <div className="dropzone-icon">📁</div>
                   <div className="dropzone-text">ลากไฟล์มาวางที่นี่ หรือ คลิกเพื่อเลือกหลายไฟล์</div>
