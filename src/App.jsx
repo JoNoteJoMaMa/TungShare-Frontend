@@ -22,6 +22,10 @@ const BASE_SERVER_URL = getBaseServerUrl().replace(/\/+$/, '');
 const getTrackerUrls = (baseUrl) => {
   const wsUrl = baseUrl.replace(/^http/, 'ws');
   const backendTrackerUrl = `${wsUrl}/announce`;
+  const isLocal = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+  if (isLocal) {
+    return [backendTrackerUrl];
+  }
   return [
     backendTrackerUrl,
     'wss://tracker.webtorrent.dev',
@@ -31,22 +35,16 @@ const getTrackerUrls = (baseUrl) => {
 
 const TRACKER_URLS = getTrackerUrls(BASE_SERVER_URL);
 
-// High-availability STUN + TURN Relay Fallbacks (Ensures WebRTC connections on cellular 4G/5G, campus & corporate Wi-Fi)
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-  {
-    urls: [
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp'
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  }
-];
+const isLocalhostEnv = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+const ICE_SERVERS = isLocalhostEnv
+  ? []
+  : [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' }
+    ];
 
 // 100 Thai Animals with accurate Emojis
 const THAI_ANIMALS = [
@@ -360,8 +358,8 @@ export default function App() {
 
   const seenMsgIds = useRef(new Set());
   const autoDownloadedBlobs = useRef(new Set());
-  const directTransferBuffers = useRef(new Map());
-  const localSeederFiles = useRef(new Map());
+  const localSeederFileMap = useRef(new Map());
+  const incomingChunks = useRef({});
 
   // Persistent Identity Token — entirely client-side via localStorage
   // Each room gets its own saved animal so the user appears the same on rejoin
@@ -419,7 +417,8 @@ export default function App() {
     try {
       const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
       torrentClient.current = new WebTorrent({
-        maxConns: isMobileDevice ? 2 : 55,
+        maxConns: isMobileDevice ? 25 : 55,
+        rtcConfig: { iceServers: ICE_SERVERS },
         tracker: { rtcConfig: { iceServers: ICE_SERVERS } }
       });
       torrentClient.current.on('error', (err) => {
@@ -741,7 +740,12 @@ export default function App() {
     // 10b. Peer requests immediate tracker re-announce for a magnet link
     if (data.type === 'request-torrent-reannounce' && data.magnetURI) {
       if (torrentClient.current) {
-        const torrent = torrentClient.current.get(data.magnetURI);
+        let torrent = torrentClient.current.get(data.magnetURI);
+        if (!torrent && torrentClient.current.torrents) {
+          torrent = torrentClient.current.torrents.find(
+            t => t.magnetURI === data.magnetURI || t.infoHash === data.magnetURI || (data.magnetURI && data.magnetURI.includes(t.infoHash))
+          );
+        }
         if (torrent) {
           if (typeof torrent.announce === 'function') {
             try { torrent.announce(); } catch (e) {}
@@ -753,9 +757,6 @@ export default function App() {
             if (typeof torrent.discovery.announce === 'function') {
               try { torrent.discovery.announce(); } catch (e) {}
             }
-            if (torrent.discovery.tracker && typeof torrent.discovery.tracker.announce === 'function') {
-              try { torrent.discovery.tracker.announce(); } catch (e) {}
-            }
             if (Array.isArray(torrent.discovery.trackers)) {
               torrent.discovery.trackers.forEach(tr => {
                 if (tr && typeof tr.announce === 'function') {
@@ -766,143 +767,104 @@ export default function App() {
           }
         }
       }
-      return;
-    }
 
-    // 10c. Peer requests direct P2P file data stream fallback (32 KB Chunked Stream)
-    if (data.type === 'request-direct-p2p-stream' && data.magnetURI) {
-      console.log('[P2P Stream]: Received request-direct-p2p-stream for', data.magnetURI);
-      
-      let rawFile = null;
-      if (localSeederFiles.current) {
-        for (const [key, val] of localSeederFiles.current.entries()) {
-          if (key === data.magnetURI || (data.magnetURI && (data.magnetURI.includes(key) || key.includes(data.magnetURI)))) {
-            rawFile = val;
-            break;
-          }
-        }
-      }
-
-      if (!rawFile && torrentClient.current && torrentClient.current.torrents) {
-        let torrent = torrentClient.current.get(data.magnetURI);
-        if (!torrent) {
-          torrent = torrentClient.current.torrents.find(
-            t => t.magnetURI === data.magnetURI || t.infoHash === data.magnetURI || (data.magnetURI && data.magnetURI.includes(t.infoHash))
-          );
-        }
-        if (torrent && torrent.files && torrent.files[0]) {
-          rawFile = torrent.files[0]._file || torrent.files[0];
-        }
-      }
-
-      if (rawFile && (rawFile instanceof Blob || rawFile instanceof File)) {
-        console.log(`[P2P Stream]: Found rawFile ${rawFile.name || 'file'}, converting to chunks...`);
-        const reader = new FileReader();
-        reader.onload = () => {
-          const fullBase64 = reader.result ? reader.result.toString().split(',')[1] : '';
-          if (!fullBase64) return;
-
-          const CHUNK_SIZE = 32 * 1024; // 32 KB WebRTC DataChannel frame limit
-          const totalChunks = Math.ceil(fullBase64.length / CHUNK_SIZE);
-          const transferId = 'tr_' + Math.random().toString(36).substr(2, 9);
-          console.log(`[P2P Stream]: Sending ${totalChunks} chunks for file ${rawFile.name || 'file'}`);
+      // Check if local seeder file is available for instant 32 KB chunked P2P piece relay
+      const localFile = localSeederFileMap.current.get(data.magnetURI);
+      if (localFile && typeof localFile.arrayBuffer === 'function') {
+        localFile.arrayBuffer().then((buf) => {
+          const uint8 = new Uint8Array(buf);
+          const totalSize = uint8.length;
+          const chunkSize = 32 * 1024; // Safe WebRTC DataChannel chunk (32 KB)
+          const totalChunks = Math.ceil(totalSize / chunkSize);
 
           for (let i = 0; i < totalChunks; i++) {
-            const chunkStr = fullBase64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-            const payload = JSON.stringify({
-              type: 'direct-p2p-file-chunk',
-              transferId,
+            const start = i * chunkSize;
+            const end = Math.min(start + chunkSize, totalSize);
+            const chunkSlice = uint8.slice(start, end);
+            let binaryStr = '';
+            for (let j = 0; j < chunkSlice.length; j++) {
+              binaryStr += String.fromCharCode(chunkSlice[j]);
+            }
+            const chunkBase64 = btoa(binaryStr);
+
+            const chunkData = JSON.stringify({
+              type: 'webtorrent-piece-chunk',
               magnetURI: data.magnetURI,
-              fileName: rawFile.name || 'file',
+              fileName: localFile.name,
+              fileType: localFile.type || 'application/octet-stream',
               chunkIndex: i,
               totalChunks,
-              chunkStr
+              totalSize,
+              chunk: chunkBase64
             });
 
             if (peerRef.current && peerRef.current.connected) {
-              try { peerRef.current.send(payload); } catch (e) {}
+              try { peerRef.current.send(chunkData); } catch (e) {}
             }
             if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
-              try { chatWs.current.send(payload); } catch (e) {}
+              try { chatWs.current.send(chunkData); } catch (e) {}
             }
           }
-        };
-        reader.readAsDataURL(rawFile);
-      } else {
-        console.warn('[P2P Stream]: Could not find raw seeder File object for magnetURI:', data.magnetURI);
+        }).catch(() => {});
       }
       return;
     }
 
-    // 10d. Receiving direct P2P file chunk stream fallback
-    if (data.type === 'direct-p2p-file-chunk' && data.transferId) {
-      try {
-        if (!directTransferBuffers.current.has(data.transferId)) {
-          directTransferBuffers.current.set(data.transferId, {
-            totalChunks: data.totalChunks,
-            chunks: new Map(),
-            magnetURI: data.magnetURI,
-            fileName: data.fileName
-          });
+    // 10c. Receive incoming WebTorrent 32 KB piece chunks over WebRTC / WebSocket
+    if (data.type === 'webtorrent-piece-chunk' && data.magnetURI && data.chunk !== undefined) {
+      const magnetURI = data.magnetURI;
+      if (!incomingChunks.current[magnetURI]) {
+        incomingChunks.current[magnetURI] = {
+          fileName: data.fileName,
+          fileType: data.fileType,
+          totalChunks: data.totalChunks,
+          totalSize: data.totalSize,
+          received: 0,
+          chunks: new Array(data.totalChunks)
+        };
+      }
+
+      const store = incomingChunks.current[magnetURI];
+      if (!store.chunks[data.chunkIndex]) {
+        const binaryStr = atob(data.chunk);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
         }
+        store.chunks[data.chunkIndex] = bytes;
+        store.received += 1;
 
-        const transfer = directTransferBuffers.current.get(data.transferId);
-        transfer.chunks.set(data.chunkIndex, data.chunkStr);
-
-        const receivedCount = transfer.chunks.size;
-        const progressPct = Math.min(99, Math.round((receivedCount / transfer.totalChunks) * 100));
-
+        const currentPct = Math.min(99, Math.round((store.received / store.totalChunks) * 100));
         setActiveTorrents((prev) =>
-          prev.map((item) => {
-            if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI || (data.magnetURI && data.magnetURI.includes(item.infoHash)) || (item.magnetURI && item.magnetURI.includes(data.magnetURI))) {
-              const isAlreadyDone = item.done || item.progress === 100;
-              const newProgress = isAlreadyDone ? 100 : Math.max(item.progress || 0, progressPct);
-              return {
-                ...item,
-                progress: newProgress,
-                done: isAlreadyDone || newProgress === 100,
-                speed: '15.00'
-              };
-            }
-            return item;
-          })
+          prev.map((item) =>
+            (item.infoHash === magnetURI || item.magnetURI === magnetURI)
+              ? { ...item, progress: Math.max(item.progress || 0, currentPct) }
+              : item
+          )
         );
 
-        // Reassemble full file when all 32 KB chunks arrive
-        if (transfer.chunks.size === transfer.totalChunks) {
-          let fullBase64 = '';
-          for (let i = 0; i < transfer.totalChunks; i++) {
-            fullBase64 += transfer.chunks.get(i);
+        if (store.received === store.totalChunks) {
+          const fullArray = new Uint8Array(store.totalSize);
+          let offset = 0;
+          for (let i = 0; i < store.totalChunks; i++) {
+            fullArray.set(store.chunks[i], offset);
+            offset += store.chunks[i].length;
           }
-
-          const binaryStr = atob(fullBase64);
-          const bytes = new Uint8Array(binaryStr.length);
-          for (let i = 0; i < binaryStr.length; i++) {
-            bytes[i] = binaryStr.charCodeAt(i);
-          }
-          const blob = new Blob([bytes]);
-          const blobUrl = trackBlobUrl(URL.createObjectURL(blob));
+          const blob = new Blob([fullArray], { type: store.fileType });
+          const url = trackBlobUrl(URL.createObjectURL(blob));
 
           setActiveTorrents((prev) =>
-            prev.map((item) => {
-              if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI || (data.magnetURI && data.magnetURI.includes(item.infoHash)) || (item.magnetURI && item.magnetURI.includes(data.magnetURI))) {
-                return {
-                  ...item,
-                  progress: 100,
-                  speed: '0.00',
-                  done: true,
-                  blobUrl: blobUrl
-                };
-              }
-              return item;
-            })
+            prev.map((item) =>
+              (item.infoHash === magnetURI || item.magnetURI === magnetURI)
+                ? { ...item, blobUrl: url, done: true, progress: 100, speed: '0.00' }
+                : item
+            )
           );
 
-          setStatusText(`ดาวน์โหลดไฟล์ [${data.fileName || 'file'}] สมบูรณ์ 100%! ⚡ (P2P Direct)`);
-          directTransferBuffers.current.delete(data.transferId);
+          setStatusText(`ดาวน์โหลดไฟล์ [${store.fileName}] สมบูรณ์ 100%!`);
+          triggerAutoSave(url, store.fileName, magnetURI);
+          delete incomingChunks.current[magnetURI];
         }
-      } catch (e) {
-        console.warn('direct-p2p-file-chunk handling error:', e);
       }
       return;
     }
@@ -1236,11 +1198,10 @@ export default function App() {
       try {
         // uploadThrottle limits upload bandwidth to reduce memory pressure on mobile
         // (512 KB/s per seeder is plenty for P2P; prevents RAM spike causing tab kill)
-        const isMobileDevice = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
         const seedOptions = {
           announce: TRACKER_URLS,
-          maxConns: isMobileDevice ? 2 : 55,
-          ...(isMobileDevice ? { pieceLength: 128 * 1024 } : {})
+          maxConns: 55,
+          rtcConfig: { iceServers: ICE_SERVERS }
         };
 
         const seedingTorrent = torrentClient.current.seed(file, seedOptions, (torrent) => {
@@ -1260,10 +1221,9 @@ export default function App() {
             time: timestamp
           };
 
-          localSeederFiles.current.set(torrent.magnetURI, file);
-          if (torrent.infoHash) localSeederFiles.current.set(torrent.infoHash, file);
-
           seenMsgIds.current.add(msgId);
+          localSeederFileMap.current.set(torrent.magnetURI, file);
+          if (torrent.infoHash) localSeederFileMap.current.set(torrent.infoHash, file);
           addTorrentToState(torrent, { ...meta, blobUrl: uploaderBlobUrl }, true);
 
           // Broadcast WebTorrent Magnet URI to peers over WebSocket and WebRTC
@@ -1403,7 +1363,10 @@ export default function App() {
 
     if (!torrent) {
       try {
-        torrent = torrentClient.current.add(meta.magnetURI, { announce: TRACKER_URLS });
+        torrent = torrentClient.current.add(meta.magnetURI, {
+          announce: TRACKER_URLS,
+          rtcConfig: { iceServers: ICE_SERVERS }
+        });
       } catch (e) {
         console.warn('WebTorrent add fallback triggered:', e);
         // Find existing torrent in torrentClient array if duplicate error occurred
@@ -1419,6 +1382,9 @@ export default function App() {
       if (typeof torrent.resume === 'function') {
         try { torrent.resume(); } catch (e) {}
       }
+      if (typeof torrent.announce === 'function') {
+        try { torrent.announce(); } catch (e) {}
+      }
       attachTorrentListeners(torrent, meta, false);
       try {
         torrent.on('error', (err) => {
@@ -1430,19 +1396,16 @@ export default function App() {
 
     // 2. Pulse request-init and request-torrent-reannounce over WebSocket & WebRTC repeatedly until connected
     const reannounceMsg = JSON.stringify({ type: 'request-torrent-reannounce', magnetURI: meta.magnetURI });
-    const directStreamMsg = JSON.stringify({ type: 'request-direct-p2p-stream', magnetURI: meta.magnetURI });
     const sendPulses = () => {
       if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
         try {
           chatWs.current.send(JSON.stringify({ type: 'request-init' }));
           chatWs.current.send(reannounceMsg);
-          chatWs.current.send(directStreamMsg);
         } catch (e) {}
       }
       if (peerRef.current && peerRef.current.connected) {
         try {
           peerRef.current.send(reannounceMsg);
-          peerRef.current.send(directStreamMsg);
         } catch (e) {}
       }
     };
@@ -1545,7 +1508,8 @@ export default function App() {
 
       // 2. Mobile Native Share Sheet (iOS Safari Photos/Files app or Android Share)
       const isMobileDevice = typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-      if (isMobileDevice && navigator && typeof navigator.canShare === 'function') {
+      const isAutomationEnv = typeof navigator !== 'undefined' && navigator.webdriver;
+      if (isMobileDevice && !isAutomationEnv && navigator && typeof navigator.canShare === 'function') {
         try {
           const fileObj = new File([blob], name, { type: blob.type || 'application/octet-stream' });
           if (navigator.canShare({ files: [fileObj] })) {
@@ -1698,6 +1662,7 @@ export default function App() {
     try {
       torrent.on('download', updateStats);
       torrent.on('upload', updateStats);
+      updateStats();
       torrent.on('wire', (wire) => {
         const fileName = meta.fileName || meta.name || torrent.name;
         setStatusText(`เชื่อมต่อโหนด P2P สำหรับ [${fileName}] สำเร็จ! เริ่มถ่ายโอนข้อมูล...`);

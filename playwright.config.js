@@ -9,7 +9,9 @@ export default defineConfig({
       args: [
         '--allow-insecure-localhost',
         '--disable-web-security',
-        '--enable-experimental-web-platform-features'
+        '--enable-experimental-web-platform-features',
+        '--disable-features=WebRtcHideLocalIpsWithMdns',
+        '--use-fake-ui-for-media-stream'
       ]
     }
   },
