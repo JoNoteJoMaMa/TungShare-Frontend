@@ -23,9 +23,9 @@ const getTrackerUrls = (baseUrl) => {
   const wsUrl = baseUrl.replace(/^http/, 'ws');
   const backendTrackerUrl = `${wsUrl}/announce`;
   return [
+    backendTrackerUrl,
     'wss://tracker.webtorrent.dev',
-    'wss://tracker.openwebtorrent.com',
-    backendTrackerUrl
+    'wss://tracker.openwebtorrent.com'
   ];
 };
 
@@ -855,9 +855,12 @@ export default function App() {
         setActiveTorrents((prev) =>
           prev.map((item) => {
             if (item.infoHash === data.magnetURI || item.magnetURI === data.magnetURI || (data.magnetURI && data.magnetURI.includes(item.infoHash)) || (item.magnetURI && item.magnetURI.includes(data.magnetURI))) {
+              const isAlreadyDone = item.done || item.progress === 100;
+              const newProgress = isAlreadyDone ? 100 : Math.max(item.progress || 0, progressPct);
               return {
                 ...item,
-                progress: progressPct,
+                progress: newProgress,
+                done: isAlreadyDone || newProgress === 100,
                 speed: '15.00'
               };
             }
@@ -886,7 +889,7 @@ export default function App() {
                 return {
                   ...item,
                   progress: 100,
-                  speed: '15.00',
+                  speed: '0.00',
                   done: true,
                   blobUrl: blobUrl
                 };
@@ -1507,7 +1510,23 @@ export default function App() {
 
     setActiveTorrents((prev) => {
       const exists = prev.find(t => t.infoHash === torrentItem.infoHash || t.magnetURI === torrentItem.magnetURI);
-      if (exists) return prev.map(t => (t.infoHash === torrentItem.infoHash || t.magnetURI === torrentItem.magnetURI) ? { ...t, ...torrentItem } : t);
+      if (exists) {
+        return prev.map(t => {
+          if (t.infoHash === torrentItem.infoHash || t.magnetURI === torrentItem.magnetURI) {
+            const isDone = t.done || t.progress === 100 || torrentItem.done || torrentItem.isSeeder;
+            const newProgress = isDone ? 100 : Math.max(t.progress || 0, torrentItem.progress || 0);
+            return {
+              ...t,
+              ...torrentItem,
+              progress: newProgress,
+              done: isDone,
+              started: t.started || torrentItem.started,
+              blobUrl: t.blobUrl || torrentItem.blobUrl
+            };
+          }
+          return t;
+        });
+      }
       return [...prev, torrentItem];
     });
 
@@ -1643,18 +1662,20 @@ export default function App() {
 
     const updateStats = () => {
       const isDone = isSeeder || torrent.progress === 1 || torrent.done;
-      const progressPct = isSeeder ? 100 : Math.round(torrent.progress * 100);
+      const progressPct = isSeeder ? 100 : Math.round((torrent.progress || 0) * 100);
       const speedMB = (torrent.downloadSpeed / 1024 / 1024).toFixed(2);
       const fileName = meta.fileName || meta.name || torrent.name;
 
       setActiveTorrents((prev) =>
         prev.map((item) => {
           if (item.infoHash === meta.magnetURI || item.magnetURI === meta.magnetURI) {
+            const itemIsDone = item.done || item.progress === 100 || isDone;
+            const newProgress = itemIsDone ? 100 : Math.max(item.progress || 0, progressPct);
             return {
               ...item,
-              progress: progressPct,
-              speed: speedMB,
-              done: isDone
+              progress: newProgress,
+              speed: itemIsDone ? '0.00' : speedMB,
+              done: itemIsDone
             };
           }
           return item;
