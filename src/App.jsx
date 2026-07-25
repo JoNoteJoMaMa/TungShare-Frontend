@@ -402,9 +402,11 @@ export default function App() {
     createdBlobUrls.current.clear();
   };
 
-  // Keep myAnimalRef in sync for async callbacks
+  // Keep myAnimalRef and roomNameRef in sync for async callbacks
   const myAnimalRef = useRef(myAnimal);
   useEffect(() => { myAnimalRef.current = myAnimal; }, [myAnimal]);
+  const roomNameRef = useRef(roomName);
+  useEffect(() => { roomNameRef.current = roomName; }, [roomName]);
 
   // Listen to screen resize for mobile optimization
   useEffect(() => {
@@ -463,13 +465,31 @@ export default function App() {
     }
   };
 
-  // Re-acquire wake lock when user returns to the tab (mobile browsers release it on hide)
+  const lastHiddenTime = useRef(0);
+
+  // Re-acquire wake lock & auto-reconnect WebSocket when user returns to tab after lock screen / background
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'hidden') {
+        lastHiddenTime.current = Date.now();
+      } else if (document.visibilityState === 'visible') {
         // Re-acquire only if we are actively seeding
         if (torrentClient.current && torrentClient.current.torrents.some(t => t.done === false)) {
           acquireWakeLock();
+        }
+
+        if (joinedRef.current) {
+          const timeAway = lastHiddenTime.current > 0 ? Date.now() - lastHiddenTime.current : 0;
+          const isWsClosed = !chatWs.current || chatWs.current.readyState !== WebSocket.OPEN;
+
+          // If mobile OS suspended the tab for >3s or socket is closed, force refresh connection immediately
+          if (timeAway > 3000 || isWsClosed) {
+            console.log(`[Mobile Wakeup]: Returning to tab after ${timeAway}ms away. Re-synchronizing room connection...`);
+            setStatusText('กำลังฟื้นฟูการเชื่อมต่อ P2P...');
+            requestJoinRoomReconnect(roomNameRef.current, myAnimalRef.current);
+          } else if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+            try { chatWs.current.send(JSON.stringify({ type: 'request-init' })); } catch (e) {}
+          }
         }
       }
     };
@@ -558,19 +578,22 @@ export default function App() {
   // Silent WebSocket reconnect — used when heartbeat drops us (not triggered by user action)
   // Skips all modal flows, just re-opens the WS and re-syncs room state
   const requestJoinRoomReconnect = (targetRoom, resolvedAnimal) => {
+    if (!targetRoom) return;
     if (chatWs.current) {
-      try { chatWs.current.close(); } catch (e) {}
+      try {
+        chatWs.current.onclose = null;
+        chatWs.current.close();
+      } catch (e) {}
     }
     const wsUrl = `${BASE_SERVER_URL}/chat?room=${encodeURIComponent(targetRoom)}&peerId=${MY_PEER_ID}&animalName=${encodeURIComponent(resolvedAnimal.name)}&animalIcon=${encodeURIComponent(resolvedAnimal.icon)}`;
     chatWs.current = new WebSocket(wsUrl);
 
     chatWs.current.onclose = (e) => {
-      if (e.wasClean) return;
       if (!joinedRef.current) return;
-      console.warn('[WS]: Reconnect dropped again, retrying in 3s...');
+      console.warn('[WS]: Reconnect dropped again, retrying in 2s...');
       setTimeout(() => {
         if (joinedRef.current) requestJoinRoomReconnect(targetRoom, resolvedAnimal);
-      }, 3000);
+      }, 2000);
     };
 
     chatWs.current.onmessage = (event) => {
@@ -582,6 +605,15 @@ export default function App() {
         chatWs.current.send(JSON.stringify({ type: 'request-init' }));
         // Rebind the full message handler for ongoing messages
         chatWs.current.onmessage = fullMessageHandler;
+
+        // Re-announce local seeder files so other room members see them back online
+        if (localSeederFileMap.current.size > 0 && localHistory.current.length > 0) {
+          localHistory.current.forEach((item) => {
+            if (item.type === 'torrent-meta' && item.magnetURI && localSeederFileMap.current.has(item.magnetURI)) {
+              try { chatWs.current.send(JSON.stringify(item)); } catch (e) {}
+            }
+          });
+        }
       } else if (data.type === 'room-not-found') {
         // Room disappeared (everyone left) — create it again
         chatWs.current.send(JSON.stringify({ type: 'create-room', password: null }));
@@ -939,8 +971,6 @@ export default function App() {
     // Auto-reconnect if server closes the connection (e.g. heartbeat timeout on mobile)
     chatWs.current.onclose = (e) => {
       setIsJoining(false); // Always clear loading spinner on close
-      // Only reconnect if still joined and closed unexpectedly (not by user action)
-      if (e.wasClean) return; // user called ws.close() → don't reconnect
       if (!joinedRef.current) return; // user left the room → don't reconnect
       console.warn('[WS]: Connection lost, reconnecting in 2s...');
       setTimeout(() => {
@@ -1207,13 +1237,47 @@ export default function App() {
       acquireWakeLock();
 
       try {
-        // Check and remove any duplicate torrent instance from client to prevent Duplicate torrent errors on re-upload
+        // Check if the user is trying to upload a file they already uploaded or downloaded
         if (torrentClient.current && torrentClient.current.torrents && torrentClient.current.torrents.length > 0) {
           const existing = torrentClient.current.torrents.find(
             t => t.name === file.name || (t.files && t.files[0] && t.files[0].name === file.name)
           );
-          if (existing && existing.infoHash) {
-            try { torrentClient.current.remove(existing.infoHash); } catch (e) {}
+          if (existing && existing.magnetURI) {
+            // Already seeding or downloaded: Just re-broadcast the existing torrent to the room
+            setStatusText(`ไฟล์ ${file.name} มีอยู่แล้ว ทำการแชร์ลิงก์ให้ห้องอีกครั้ง...`);
+            
+            const msgId = 'torrent_' + Math.random().toString(36).substr(2, 9);
+            const timestamp = getCurrentTimeStr();
+            const meta = {
+              type: 'torrent-meta',
+              msgId,
+              magnetURI: existing.magnetURI,
+              fileName: file.name,
+              fileSize: file.size,
+              fileType: fileType,
+              animalName: myAnimal.name,
+              animalIcon: myAnimal.icon,
+              time: timestamp
+            };
+
+            seenMsgIds.current.add(msgId);
+            localHistory.current.push({ ...meta, type: 'torrent-meta' });
+            if (localHistory.current.length > MAX_LOCAL_HISTORY) localHistory.current.shift();
+            
+            if (chatWs.current && chatWs.current.readyState === WebSocket.OPEN) {
+              chatWs.current.send(JSON.stringify(meta));
+            }
+            if (peerRef.current && peerRef.current.connected) {
+              try { peerRef.current.send(JSON.stringify(meta)); } catch (e) {}
+            }
+            syncChannel.current?.postMessage(meta);
+            
+            // Re-announce tracker just to be safe
+            if (typeof existing.announce === 'function') {
+              try { existing.announce(); } catch (e) {}
+            }
+            
+            return; // Skip recreating the seed!
           }
         }
 
