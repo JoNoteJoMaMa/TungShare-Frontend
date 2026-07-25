@@ -2167,15 +2167,22 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* Show Progress Bar & Speed only if downloading or completed */}
-                      {(t.isSeeder || t.started || t.done) && (
+                      {/* For Seeder Owner: Show seeding status only (no progress bar or completion text) */}
+                      {t.isSeeder && (
+                        <div className="speed-stats">
+                          <span>🌱 กำลังปล่อย Seed</span>
+                        </div>
+                      )}
+
+                      {/* For Downloader: Show Progress Bar & Speed if downloading or completed */}
+                      {!t.isSeeder && (t.started || t.done) && (
                         <>
                           <div className="progress-bar-container">
                             <div className="progress-bar-fill" style={{ width: `${t.progress}%` }} />
                           </div>
 
                           <div className="speed-stats">
-                            <span>{t.isSeeder ? '🌱 กำลังปล่อย Seed' : `ดาวน์โหลด: ${t.progress}%`}</span>
+                            <span>ดาวน์โหลด: {t.progress}%</span>
                             <span>{t.done ? '✅ ดาวน์โหลดสำเร็จ' : `สปีด: ${t.speed} MB/s`}</span>
                           </div>
                         </>
